@@ -71,6 +71,8 @@ class EvaluationView(QtWidgets.QWidget):
             self.on_select_parameter)
         self.combobox_peak_number.currentIndexChanged.connect(
             self.on_select_parameter)
+        self.combobox_shift_method.currentIndexChanged.connect(
+            self.on_select_shift_method)
 
         self.aspect_ratio.clicked.connect(
             self.refresh_plot)
@@ -129,6 +131,11 @@ class EvaluationView(QtWidgets.QWidget):
         elif evm.nr_brillouin_peaks == 4:
             self.nrBrillouinPeaks_4.setChecked(True)
             self.bounds_table.setEnabled(True)
+
+        self.combobox_shift_method.blockSignals(True)
+        self.combobox_shift_method.setCurrentIndex(
+            int(evm.get_brillouin_shift_method() == 'fsr'))
+        self.combobox_shift_method.blockSignals(False)
 
         self.updateBoundsTable()
         self.setup_parameter_selection_combobox()
@@ -420,6 +427,9 @@ class EvaluationView(QtWidgets.QWidget):
         self.plot.cla()
         self.updateBoundsTable()
         self.nrBrillouinPeaks_1.setChecked(True)
+        self.combobox_shift_method.blockSignals(True)
+        self.combobox_shift_method.setCurrentIndex(0)
+        self.combobox_shift_method.blockSignals(False)
         self.combobox_parameter.clear()
         self.combobox_peak_number.setEnabled(False)
         self.combobox_peak_number.blockSignals(True)
@@ -454,6 +464,16 @@ class EvaluationView(QtWidgets.QWidget):
         self.combobox_parameter.blockSignals(False)
 
     def on_select_parameter(self):
+        self.refresh_plot()
+
+    def on_select_shift_method(self):
+        if self.combobox_shift_method.currentIndex() == 1:
+            method = 'fsr'
+        else:
+            method = 'rayleigh'
+        # This recalculates the Brillouin shift
+        # from the existing fits
+        self.evaluation_controller.set_brillouin_shift_method(method)
         self.refresh_plot()
 
     def on_scale_changed(self):

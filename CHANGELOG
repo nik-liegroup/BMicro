@@ -1,3 +1,11 @@
+## Unreleased
+
+### Added
+- feat(evaluation): allow choosing how the Brillouin shift is
+  calculated: from the nearest Rayleigh peak (default) or from the
+  Stokes/Anti-Stokes peak distance and the free spectral range,
+  which is robust against saturated Rayleigh peaks
+
 ## 0.12.3 - 2026-05-21
 
 ### Fixed
