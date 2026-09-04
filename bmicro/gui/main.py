@@ -181,6 +181,12 @@ class BMicro(QtWidgets.QMainWindow):
         try:
             self.close_file()
             session.set_file(file_name)
+            # Kept inside the try/except too: a valid file can still
+            # contain a repetition the UI can't render (e.g. an
+            # aborted/restarted acquisition with an empty first
+            # repetition), and that shouldn't be able to crash the
+            # whole application on open.
+            self.update_ui()
         except FileNotFoundError as e:
             msg = QMessageBox()
             msg.setIcon(QMessageBox.Icon.Warning)
@@ -195,8 +201,6 @@ class BMicro(QtWidgets.QMainWindow):
             msg.setInformativeText(str(e))
             msg.setWindowTitle('Unknown Error')
             msg.exec()
-
-        self.update_ui()
 
     def close_file(self):
         Session.get_instance().clear()
@@ -221,9 +225,29 @@ class BMicro(QtWidgets.QMainWindow):
             self.close_export_dialog
         )
         self.init_export_dialog(self.export_dialog.widget)
+
+        checkbox_overview = \
+            self.export_dialog.checkbox_export_overview_brightfield
+        checkbox_overview.setChecked(
+            self.export_config['overviewBrightfield']['export'])
+        checkbox_overview.toggled.connect(
+            self.on_export_overview_brightfield_checkbox)
+
+        checkbox_surface = self.export_dialog.checkbox_export_surface
+        checkbox_surface.setChecked(
+            self.export_config['surface']['export'])
+        checkbox_surface.toggled.connect(
+            self.on_export_surface_checkbox)
+
         self.export_dialog.resize(QSize(500, 560))
 
         self.export_dialog.open()
+
+    def on_export_overview_brightfield_checkbox(self, checked):
+        self.export_config['overviewBrightfield']['export'] = checked
+
+    def on_export_surface_checkbox(self, checked):
+        self.export_config['surface']['export'] = checked
 
     def on_export_checkbox(self, parameter, min_box, max_box):
         checked = self.sender().isChecked()

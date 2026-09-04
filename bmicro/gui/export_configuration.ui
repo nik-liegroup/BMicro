@@ -27,6 +27,29 @@
     <number>4</number>
    </property>
    <item>
+    <widget class="QGroupBox" name="groupBox_additional">
+     <property name="title">
+      <string>Additional data</string>
+     </property>
+     <layout class="QVBoxLayout" name="verticalLayout_additional">
+      <item>
+       <widget class="QCheckBox" name="checkbox_export_overview_brightfield">
+        <property name="text">
+         <string>Brightfield overview images</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="checkbox_export_surface">
+        <property name="text">
+         <string>Surface scan metrics</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
     <widget class="QWidget" name="widget_content" native="true">
      <layout class="QHBoxLayout" name="horizontalLayout_2">
       <property name="leftMargin">

@@ -128,9 +128,11 @@ class PeakSelectionView(QtWidgets.QWidget):
         evc = EvaluationController()
 
         try:
-            image_key = '0'
+            image_keys = session.get_image_keys()
+            if not image_keys:
+                return
             spectra, times, _ = evc.extract_spectra(
-                image_key
+                image_keys[0]
             )
             if spectra is None:
                 return

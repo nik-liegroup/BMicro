@@ -51,9 +51,17 @@ class EvaluationView(QtWidgets.QWidget):
                                    toolbar=('Home', 'Pan', 'Zoom'))
         self.mplcanvas.get_figure().canvas.mpl_connect(
             'button_press_event', self.on_click_image)
+        self.mplcanvas.get_figure().canvas.mpl_connect(
+            'button_press_event', self.on_3d_button_press)
+        self.mplcanvas.get_figure().canvas.mpl_connect(
+            'button_release_event', self.on_3d_button_release)
         self.plot = self.mplcanvas.get_figure().add_subplot(111)
         self.image_map = None
         self.colorbar = None
+        # Cache of the data needed to redraw the 3D plot, populated by
+        # refresh_plot() and consumed by on_3d_button_press/release()
+        # for the rotate-drag LOD (see _draw_3d_surfaces()).
+        self.plot_3d_cache = None
 
         self.image_spectrum_dialog = None
         self.isd_image_canvas = None
@@ -416,6 +424,7 @@ class EvaluationView(QtWidgets.QWidget):
 
     def reset_ui(self):
         self.evaluation_progress.setValue(0)
+        self.plot_3d_cache = None
         self.clear_plots()
         self.plot.cla()
         self.updateBoundsTable()
@@ -555,6 +564,16 @@ class EvaluationView(QtWidgets.QWidget):
             self.evaluation_controller.\
             get_data(parameter_key, brillouin_peak_index)
 
+        # The current repetition has no valid measurement grid
+        # (e.g. an aborted/restarted acquisition that never wrote
+        # any positions) - there is nothing to plot.
+        if dimensionality is None:
+            self.plot_3d_cache = None
+            self.clear_plots()
+            self.plot.cla()
+            self.mplcanvas.draw()
+            return
+
         # Subtract the mean value of the positions,
         # so they are centered around zero
         for position in positions:
@@ -566,10 +585,17 @@ class EvaluationView(QtWidgets.QWidget):
             self.mplcanvas.get_figure().delaxes(self.plot)
             self.plot = self.mplcanvas.\
                 get_figure().add_subplot(111)
-        if dimensionality == 3:
-            self.mplcanvas.get_figure().clf()
-            self.plot = self.mplcanvas.\
-                get_figure().add_subplot(111, projection='3d')
+
+        # _draw_3d_surfaces() owns (re)creating the 3D axes itself,
+        # since it's also called from the rotate-drag LOD handlers
+        # independently of refresh_plot().
+        self.plot_3d_cache = None if dimensionality != 3 else {
+            'positions': positions,
+            'data': data,
+            'labels': labels,
+            'parameter_key': parameter_key,
+            'parameters': parameters,
+        }
 
         # Create the slices list
         dslice = [slice(None) if dim > 1 else 0 for dim in data.shape]
@@ -682,50 +708,116 @@ class EvaluationView(QtWidgets.QWidget):
                     np.nanmax(positions[idx[1]][tuple(dslice)])
                 )
             if dimensionality == 3:
-                (value_min, value_max) = self.get_plot_limits(data)
-
-                scalar_map = matplotlib.cm.ScalarMappable(
-                    norm=Normalize(vmin=value_min, vmax=value_max),
-                    cmap=matplotlib.cm.viridis
-                )
-
-                plots = []
-
-                # We slice the data along the last occurrence
-                # of the shortest dimension
-                b = data.shape[::-1]
-                axis = len(b) - np.argmin(b) - 1
-
-                for slice_idx in range(data.shape[axis]):
-                    dslice[axis] = slice_idx
-
-                    idx_t = tuple(dslice)
-                    s = self.plot.plot_surface(
-                        positions[0][idx_t],
-                        positions[1][idx_t],
-                        positions[2][idx_t],
-                        facecolors=scalar_map.to_rgba(data[idx_t]),
-                        shade=False
-                    )
-                    plots.append(s)
-                self.image_map = plots
-                self.plot.set_xlabel(labels[0])
-                self.plot.set_ylabel(labels[1])
-                self.plot.set_zlabel(labels[2])
-
-                self.colorbar =\
-                    self.mplcanvas.get_figure().colorbar(
-                        scalar_map,
-                        ax=self.plot
-                    )
-                cb_label = parameters[parameter_key]['symbol'] +\
-                    ' [' + parameters[parameter_key]['unit'] + ']'
-                self.colorbar.ax.set_title(cb_label)
+                self._draw_3d_surfaces(stride=1)
 
             self.mplcanvas.draw()
         except Exception as e:
             self.reset_ui()
             raise e
+
+    def _draw_3d_surfaces(self, stride=1):
+        """
+        Renders the 3D evaluation plot from self.plot_3d_cache
+        (populated by refresh_plot()).
+
+        matplotlib's mplot3d has to re-sort every polygon face on
+        every redraw (e.g. on every frame while the user drags to
+        rotate), which doesn't scale well for a dense measurement
+        grid. `stride` > 1 renders a decimated, much faster-to-rotate
+        preview by keeping only every `stride`-th slice/row/column;
+        this is used by on_3d_button_press() while actively dragging,
+        and full resolution (stride=1) is restored on mouse release
+        and by refresh_plot() otherwise.
+        """
+        cache = self.plot_3d_cache
+        if cache is None:
+            return
+        positions = cache['positions']
+        data = cache['data']
+        labels = cache['labels']
+        parameter_key = cache['parameter_key']
+        parameters = cache['parameters']
+
+        self.mplcanvas.get_figure().clf()
+        self.plot = self.mplcanvas.get_figure().add_subplot(
+            111, projection='3d')
+
+        (value_min, value_max) = self.get_plot_limits(data)
+
+        scalar_map = matplotlib.cm.ScalarMappable(
+            norm=Normalize(vmin=value_min, vmax=value_max),
+            cmap=matplotlib.cm.viridis
+        )
+
+        dslice = [slice(None) if dim > 1 else 0 for dim in data.shape]
+
+        plots = []
+
+        # We slice the data along the last occurrence
+        # of the shortest dimension
+        b = data.shape[::-1]
+        axis = len(b) - np.argmin(b) - 1
+
+        for slice_idx in range(0, data.shape[axis], stride):
+            dslice[axis] = slice_idx
+
+            idx_t = tuple(dslice)
+            x = positions[0][idx_t][::stride, ::stride]
+            y = positions[1][idx_t][::stride, ::stride]
+            z = positions[2][idx_t][::stride, ::stride]
+            c = data[idx_t][::stride, ::stride]
+            if x.size == 0:
+                continue
+            s = self.plot.plot_surface(
+                x, y, z,
+                facecolors=scalar_map.to_rgba(c),
+                shade=False
+            )
+            plots.append(s)
+        self.image_map = plots
+        self.plot.set_xlabel(labels[0])
+        self.plot.set_ylabel(labels[1])
+        self.plot.set_zlabel(labels[2])
+
+        self.colorbar =\
+            self.mplcanvas.get_figure().colorbar(
+                scalar_map,
+                ax=self.plot
+            )
+        cb_label = parameters[parameter_key]['symbol'] +\
+            ' [' + parameters[parameter_key]['unit'] + ']'
+        self.colorbar.ax.set_title(cb_label)
+
+    @staticmethod
+    def _get_decimation_stride(shape, target_max_points=600):
+        total_points = int(np.prod(shape))
+        if total_points <= target_max_points:
+            return 1
+        return max(1, int(
+            np.ceil((total_points / target_max_points) ** (1 / 3))))
+
+    def on_3d_button_press(self, event):
+        """
+        Swaps in a decimated (faster to rotate) version of the 3D
+        plot the moment the user starts dragging inside it.
+        """
+        if self.plot_3d_cache is None:
+            return
+        if event.inaxes is not self.plot:
+            return
+        stride = self._get_decimation_stride(
+            self.plot_3d_cache['data'].shape)
+        if stride <= 1:
+            return
+        self._draw_3d_surfaces(stride=stride)
+        self.mplcanvas.draw()
+
+    def on_3d_button_release(self, event):
+        """ Restores full detail once the user stops dragging. """
+        if self.plot_3d_cache is None:
+            return
+        self._draw_3d_surfaces(stride=1)
+        self.mplcanvas.draw()
 
     def get_plot_limits(self, data):
         if self.autoscale.isChecked():

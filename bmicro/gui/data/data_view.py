@@ -240,7 +240,7 @@ class DataView(QtWidgets.QWidget):
         session = Session.get_instance()
         rep_key = self.comboBox_repetition.currentText()
         session.set_current_repetition(rep_key)
-        self.update_preview()
+        self.update_ui()
 
     def on_select_setup(self):
         """
