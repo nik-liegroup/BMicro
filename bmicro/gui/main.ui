@@ -86,6 +86,7 @@
     <addaction name="action_save"/>
     <addaction name="separator"/>
     <addaction name="action_batch_evaluation"/>
+    <addaction name="action_batch_export"/>
     <addaction name="separator"/>
     <addaction name="action_exit"/>
    </widget>
@@ -162,6 +163,11 @@
    </property>
    <property name="shortcut">
     <string>Ctrl+B</string>
+   </property>
+  </action>
+  <action name="action_batch_export">
+   <property name="text">
+    <string>Batch export</string>
    </property>
   </action>
  </widget>

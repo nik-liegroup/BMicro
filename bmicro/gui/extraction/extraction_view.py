@@ -61,6 +61,9 @@ class ExtractionView(QtWidgets.QWidget):
         self.button_prev_frame.clicked.connect(self.prev_frame)
         self.button_next_frame.clicked.connect(self.next_frame)
 
+        self.checkbox_use_zoom_as_crop.toggled.connect(
+            self.on_toggle_use_zoom_as_crop)
+
         self.update_ui()
         self.checkFrameNavigationButtons()
 
@@ -69,6 +72,15 @@ class ExtractionView(QtWidgets.QWidget):
     def update_ui(self):
         session = Session.get_instance()
         self.combobox_datasets.clear()
+
+        # Reflect whatever crop is already set on the session (e.g. loaded
+        # from a session file) without re-triggering the toggle handler,
+        # which would overwrite it with the current (unrelated) zoom.
+        self.checkbox_use_zoom_as_crop.blockSignals(True)
+        self.checkbox_use_zoom_as_crop.setChecked(
+            session.get_crop_bounds() is not None)
+        self.checkbox_use_zoom_as_crop.blockSignals(False)
+
         if not session.current_repetition():
             return
 
@@ -78,6 +90,9 @@ class ExtractionView(QtWidgets.QWidget):
     def reset_ui(self):
         self.combobox_datasets.clear()
         self.table_selected_points.setRowCount(0)
+        self.checkbox_use_zoom_as_crop.blockSignals(True)
+        self.checkbox_use_zoom_as_crop.setChecked(False)
+        self.checkbox_use_zoom_as_crop.blockSignals(False)
         self.refresh_image_plot()
 
     def prev_frame(self):
@@ -117,6 +132,26 @@ class ExtractionView(QtWidgets.QWidget):
         self.checkFrameNavigationButtons()
         self.refresh_image_plot()
 
+    def on_toggle_use_zoom_as_crop(self, checked):
+        """
+        Locks in the plot's current zoom (from the toolbar's Pan/Zoom
+        tool) as a pixel crop applied to every calibration/payload image
+        used in extraction, calibration fitting, and evaluation for the
+        whole file - not just the currently displayed one. Useful when
+        the camera ROI used at acquisition time was wider than a single
+        VIPA order, without needing to re-acquire the data.
+
+        Unchecking removes the crop and restores the full image.
+        """
+        session = Session.get_instance()
+        if checked:
+            x_min, x_max = self.image_plot.get_xlim()
+            y_min, y_max = self.image_plot.get_ylim()
+            session.set_crop_bounds((x_min, x_max, y_min, y_max))
+        else:
+            session.clear_crop()
+        self.refresh_image_plot()
+
     def on_click_image(self, event):
         """
         Action triggered when user clicks on preview image in selection mode.
@@ -142,10 +177,20 @@ class ExtractionView(QtWidgets.QWidget):
         Updates the plot of the selected calibration image.
         """
         self.image_plot.cla()
+        # cla() drops any callbacks registered on the axes, so reconnect
+        # these every refresh rather than once in __init__: fires on
+        # every zoom/pan (toolbar or programmatic) so the label stays
+        # live while the user is dragging the Zoom tool, not just when
+        # they let go of the mouse.
+        self.image_plot.callbacks.connect(
+            'xlim_changed', self.update_zoom_label)
+        self.image_plot.callbacks.connect(
+            'ylim_changed', self.update_zoom_label)
         session = Session.get_instance()
         calib_key = self.combobox_datasets.currentText()
         if not calib_key:
             self.mplcanvas.draw()
+            self.update_zoom_label()
             return
 
         em = session.extraction_model()
@@ -174,6 +219,25 @@ class ExtractionView(QtWidgets.QWidget):
 
         self.mplcanvas.draw()
         self.refresh_points()
+        self.update_zoom_label()
+
+    def update_zoom_label(self, *_):
+        """
+        Shows the plot's current zoom as live pixel bounds, in the same
+        (x, y) convention as the crop and as extraction points - compare
+        directly against BrillouinAcquisition's own ROI panel
+        (Left/Top/Width/Height) to line up the same physical region
+        without needing to eyeball it.
+
+        Takes an optional, unused argument so it can be used directly as
+        a matplotlib axes callback (xlim_changed/ylim_changed pass the
+        Axes as their sole argument).
+        """
+        x_min, x_max = self.image_plot.get_xlim()
+        y_min, y_max = self.image_plot.get_ylim()
+        self.label_zoom_bounds.setText(
+            'Zoom: x [%d, %d]  y [%d, %d]' % (
+                round(x_min), round(x_max), round(y_min), round(y_max)))
 
     def setupTable(self):
         self.table_selected_points.setColumnCount(2)

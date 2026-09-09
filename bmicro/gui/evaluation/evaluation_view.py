@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib
 from matplotlib.colors import Normalize
 from mpl_toolkits.mplot3d.axes3d import Axes3D
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import warnings
 
 import time
@@ -51,17 +52,9 @@ class EvaluationView(QtWidgets.QWidget):
                                    toolbar=('Home', 'Pan', 'Zoom'))
         self.mplcanvas.get_figure().canvas.mpl_connect(
             'button_press_event', self.on_click_image)
-        self.mplcanvas.get_figure().canvas.mpl_connect(
-            'button_press_event', self.on_3d_button_press)
-        self.mplcanvas.get_figure().canvas.mpl_connect(
-            'button_release_event', self.on_3d_button_release)
         self.plot = self.mplcanvas.get_figure().add_subplot(111)
         self.image_map = None
         self.colorbar = None
-        # Cache of the data needed to redraw the 3D plot, populated by
-        # refresh_plot() and consumed by on_3d_button_press/release()
-        # for the rotate-drag LOD (see _draw_3d_surfaces()).
-        self.plot_3d_cache = None
 
         self.image_spectrum_dialog = None
         self.isd_image_canvas = None
@@ -82,6 +75,26 @@ class EvaluationView(QtWidgets.QWidget):
 
         self.aspect_ratio.clicked.connect(
             self.refresh_plot)
+
+        # 3D data can be viewed either as a single 2D z-slice (paged
+        # through with a slider) or as actual 3D cubes at the real
+        # measurement positions - see refresh_plot(). Both widgets are
+        # hidden for non-3D data.
+        self.show_3d = False
+        self.z_slice_index = 0
+        self.button_toggle_3d.setVisible(False)
+        self.button_toggle_3d.clicked.connect(self.on_toggle_3d_view)
+        self.z_slider.setVisible(False)
+        self.label_z_slider.setVisible(False)
+        self.label_z_value.setVisible(False)
+        self.z_slider.valueChanged.connect(self.on_z_slider_changed)
+        self.checkbox_transparent_blocks.setVisible(False)
+        self.checkbox_transparent_blocks.clicked.connect(self.refresh_plot)
+
+        # Set by refresh_plot() when a 2D image (a genuine 2D dataset or
+        # a single z-slice of a 3D one) is drawn, so on_click_image()
+        # knows how to map a click back onto the data/positions arrays.
+        self._click_context = None
 
         self.autoscale.clicked.connect(
             self.on_scale_changed)
@@ -178,12 +191,18 @@ class EvaluationView(QtWidgets.QWidget):
         event: matplotlib event object
             The mouse click event.
         """
-        # If the click is outside the axes, skip it
-        if event.inaxes is None:
+        # If the click is outside the plot axes, skip it (this also
+        # rejects clicks on the colorbar, which has its own axes)
+        if event.inaxes is not self.plot:
             return
         # If we don't have a session we have not loaded data yet
         session = Session.get_instance()
         if session is None:
+            return
+        # Only available while a 1D/2D plot is shown - see refresh_plot().
+        # For a 2D slice of a 3D dataset this also covers the out-of-plane
+        # (e.g. z) axis, which is pinned to the currently displayed index.
+        if self._click_context is None:
             return
 
         # Get the resolution of the measurement
@@ -191,25 +210,30 @@ class EvaluationView(QtWidgets.QWidget):
         if resolution is None:
             return
 
-        # Get the positions and normalize them
+        # Get the positions. x and y are centered around zero (they are
+        # relative sample coordinates), but z is left as the actual
+        # acquired stage position.
         positions = list(self.session.get_payload_positions().values())
-        for position in positions:
+        for position in positions[:2]:
             position -= np.nanmean(position)
 
-        # Get the indices of the dimensions to check
-        idx = [idx for idx, dim in enumerate(resolution) if dim > 1]
+        idx = self._click_context['idx']
+        dslice = self._click_context['dslice']
 
-        # Only works for 1D and 2D plots
-        if len(idx) < 1 or len(idx) > 2:
-            return
-
-        # Determine the indices of the click in the positions arrays
+        # Start from the indices of the currently displayed slice (this
+        # carries over any axis - e.g. z - that is fixed rather than
+        # shown in-plane), then determine the click position along each
+        # in-plane axis.
         click_pos = (event.xdata, event.ydata)
-        indices = np.zeros(len(resolution), dtype="int")
+        indices = np.array(
+            [0 if isinstance(v, slice) else v for v in dslice],
+            dtype="int"
+        )
         for ind, p_ind in enumerate(idx):
-            dslice = [slice(None) if p_ind == i else 0
-                      for i, res in enumerate(resolution)]
-            r = abs(positions[p_ind][tuple(dslice)] - click_pos[ind])
+            pslice = [dslice[i] if i not in idx
+                      else (slice(None) if i == p_ind else 0)
+                      for i in range(len(resolution))]
+            r = abs(positions[p_ind][tuple(pslice)] - click_pos[ind])
             indices[p_ind] = int(np.argmin(r))
 
         # Convert indices to key
@@ -410,10 +434,45 @@ class EvaluationView(QtWidgets.QWidget):
                     self.bounds_table.item(row, column).text()
 
     def clear_plots(self):
-        if isinstance(self.colorbar, matplotlib.colorbar.Colorbar):
-            self.colorbar.remove()
-            self.colorbar = None
-        # Clear existing plots
+        self._remove_image_map()
+        self._remove_colorbar()
+
+    def _remove_colorbar(self):
+        # Guard against colorbar.ax already being gone from the figure
+        # (e.g. a prior figure.clf() destroyed it without going through
+        # this method) - Colorbar.remove() raises a KeyError from mpl's
+        # own axes bookkeeping in that case instead of being a no-op.
+        if isinstance(self.colorbar, matplotlib.colorbar.Colorbar) \
+                and self.colorbar.ax in self.mplcanvas.get_figure().axes:
+            try:
+                self.colorbar.remove()
+            except Exception:
+                # Colorbar.remove() can also fail on internal state we
+                # don't fully control: we deliberately reuse a colorbar
+                # across refreshes via update_normal() (see
+                # _update_colorbar) instead of always recreating it, to
+                # keep the 3D view's axes position stable - and that
+                # apparently leaves mpl's own bookkeeping inconsistent
+                # in ways that show up as different exceptions (seen:
+                # KeyError disconnecting an already-gone axes,
+                # AttributeError disconnecting a mappable callback that
+                # was never registered). Rather than chase every such
+                # case, fall back to removing the axes directly - a
+                # crash here would lose the user's session, whereas
+                # worst case this leaves a stale colorbar visible until
+                # the next full figure clear.
+                logger.warning(
+                    'Colorbar.remove() failed, removing its axes '
+                    'directly instead', exc_info=True)
+                try:
+                    self.mplcanvas.get_figure().delaxes(self.colorbar.ax)
+                except Exception:
+                    logger.warning(
+                        'Removing the colorbar axes directly also '
+                        'failed', exc_info=True)
+        self.colorbar = None
+
+    def _remove_image_map(self):
         if isinstance(self.image_map, list):
             for m in self.image_map:
                 m.remove()
@@ -422,14 +481,67 @@ class EvaluationView(QtWidgets.QWidget):
             self.image_map.remove()
             self.image_map = None
 
+    def _update_colorbar(self, mappable, label):
+        """
+        Creates the colorbar on first use, and just updates the existing
+        one afterwards. Removing and re-creating it on every refresh
+        (as used to happen for the 3D block view, which has to redraw
+        its Poly3DCollection from scratch on every update) shifts the
+        main plot's axes position a little each time on Axes3D - mpl
+        does not fully restore the pre-colorbar position on remove() -
+        which is what caused the plot to keep resizing during live
+        updates/fitting.
+        """
+        if isinstance(self.colorbar, matplotlib.colorbar.Colorbar):
+            self.colorbar.update_normal(mappable)
+        else:
+            self.colorbar = self.mplcanvas.get_figure().colorbar(
+                mappable, ax=self.plot)
+        self.colorbar.ax.set_title(label)
+
     def reset_ui(self):
         self.evaluation_progress.setValue(0)
-        self.plot_3d_cache = None
-        self.clear_plots()
-        self.plot.cla()
+        self.show_3d = False
+        self.button_toggle_3d.setText('Switch to 3D view')
+        self.button_toggle_3d.setVisible(False)
+        self.z_slider.setVisible(False)
+        self.label_z_slider.setVisible(False)
+        self.label_z_value.setVisible(False)
+        self.checkbox_transparent_blocks.setVisible(False)
+        self._click_context = None
+        # A full figure.clf() + fresh subplot, rather than clear_plots()
+        # + plot.cla(): the latter only clears what's *drawn* on the
+        # existing Axes, but leaves it (and any layout/subplotspec state
+        # matplotlib accumulated on it and the figure across repeated
+        # colorbar/3D-view create-destroy cycles - see _update_colorbar
+        # and the 3D<->2D toggle in refresh_plot) in place, ready to
+        # carry stale internal state into whatever file gets opened
+        # next. clf() and a brand new Axes sidesteps that class of
+        # matplotlib-internal-state bugs entirely instead of chasing
+        # each way it can surface (a KeyError, then an AttributeError,
+        # then this - a NoneType with no set_subplotspec - all from the
+        # same "reuse across transitions" optimization, just triggered
+        # by different transitions). It's fine to fully rebuild here:
+        # unlike the live-update case _update_colorbar optimizes for,
+        # switching files means starting over is exactly right anyway.
+        self.mplcanvas.get_figure().clf()
+        self.plot = self.mplcanvas.get_figure().add_subplot(111)
+        self.image_map = None
+        self.colorbar = None
         self.updateBoundsTable()
         self.nrBrillouinPeaks_1.setChecked(True)
+        # Blocked for the same reason as combobox_peak_number just
+        # below: unblocked, clear() changes the current index and fires
+        # currentIndexChanged -> on_select_parameter -> refresh_plot(),
+        # re-entrantly, while the session still points at whatever file
+        # was open before this reset - not the new one being switched
+        # to (reset_ui() runs before that happens). That stray render
+        # was creating a colorbar from stale data mid-teardown, which
+        # is what later broke when the real refresh for the new file
+        # tried to clean it up.
+        self.combobox_parameter.blockSignals(True)
         self.combobox_parameter.clear()
+        self.combobox_parameter.blockSignals(False)
         self.combobox_peak_number.setEnabled(False)
         self.combobox_peak_number.blockSignals(True)
         self.combobox_peak_number.clear()
@@ -564,42 +676,99 @@ class EvaluationView(QtWidgets.QWidget):
             self.evaluation_controller.\
             get_data(parameter_key, brillouin_peak_index)
 
+        # Reset click-to-spectrum context; it is only set below when we
+        # actually draw a 2D image (a genuine 2D dataset, or a single
+        # z-slice of a 3D one) that clicking can be mapped onto.
+        self._click_context = None
+
         # The current repetition has no valid measurement grid
         # (e.g. an aborted/restarted acquisition that never wrote
         # any positions) - there is nothing to plot.
         if dimensionality is None:
-            self.plot_3d_cache = None
-            self.clear_plots()
-            self.plot.cla()
+            # Full rebuild, not just clear_plots() + plot.cla() - see
+            # the comment in reset_ui() for why: this is a similar
+            # "starting over" transition (switching to a repetition
+            # with no valid data), so the same stale-layout-state risk
+            # applies here.
+            self.mplcanvas.get_figure().clf()
+            self.plot = self.mplcanvas.get_figure().add_subplot(111)
+            self.image_map = None
+            self.colorbar = None
             self.mplcanvas.draw()
             return
 
-        # Subtract the mean value of the positions,
-        # so they are centered around zero
-        for position in positions:
+        # Center x and y around zero (relative sample coordinates);
+        # z is left as the actual acquired stage position.
+        for position in positions[:2]:
             position -= np.nanmean(position)
 
-        # Check that we have the correct subplot type
-        if dimensionality != 3\
-                and isinstance(self.plot, Axes3D):
+        self.button_toggle_3d.setVisible(bool(dimensionality == 3))
+        self.checkbox_transparent_blocks.setVisible(
+            bool(dimensionality == 3 and self.show_3d))
+
+        # Check that we have the axes type the current mode needs.
+        want_3d_axes = dimensionality == 3 and self.show_3d
+        if want_3d_axes and not isinstance(self.plot, Axes3D):
+            self.mplcanvas.get_figure().clf()
+            self.plot = self.mplcanvas.\
+                get_figure().add_subplot(111, projection='3d')
+            # The old image_map/colorbar were destroyed by clf() above,
+            # not just logically stale - don't try to .remove() them.
+            self.image_map = None
+            self.colorbar = None
+        elif not want_3d_axes and isinstance(self.plot, Axes3D):
+            # delaxes() only removes the 3D plot axes. The colorbar lives
+            # in its own separate axes (created by fig.colorbar()) and
+            # is untouched by that, so without removing it explicitly it
+            # is left behind as a stale, second colorbar when we then
+            # create a fresh one for the 2D view.
+            self._remove_colorbar()
             self.mplcanvas.get_figure().delaxes(self.plot)
             self.plot = self.mplcanvas.\
                 get_figure().add_subplot(111)
-
-        # _draw_3d_surfaces() owns (re)creating the 3D axes itself,
-        # since it's also called from the rotate-drag LOD handlers
-        # independently of refresh_plot().
-        self.plot_3d_cache = None if dimensionality != 3 else {
-            'positions': positions,
-            'data': data,
-            'labels': labels,
-            'parameter_key': parameter_key,
-            'parameters': parameters,
-        }
+            self.image_map = None
 
         # Create the slices list
         dslice = [slice(None) if dim > 1 else 0 for dim in data.shape]
         idx = [idx for idx, dim in enumerate(data.shape) if dim > 1]
+
+        # A 3D dataset is either shown as actual 3D cubes at the real
+        # measurement positions (show_3d), or one 2D z-slice at a time
+        # via the slider, rendered exactly like a regular 2D dataset
+        # (see dimensionality == 2, further down).
+        if dimensionality == 3 and not self.show_3d:
+            # Slice along the last occurrence of the shortest dimension
+            b = data.shape[::-1]
+            z_axis = len(b) - np.argmin(b) - 1
+            z_len = data.shape[z_axis]
+            self.z_slice_index = min(self.z_slice_index, z_len - 1)
+            self.z_slider.blockSignals(True)
+            self.z_slider.setMinimum(0)
+            self.z_slider.setMaximum(z_len - 1)
+            self.z_slider.setValue(self.z_slice_index)
+            self.z_slider.blockSignals(False)
+            self.z_slider.setVisible(True)
+            self.label_z_slider.setVisible(True)
+            self.label_z_value.setVisible(True)
+
+            dslice[z_axis] = self.z_slice_index
+            idx = [i for i in idx if i != z_axis]
+            z_value = np.nanmean(positions[z_axis][tuple(dslice)])
+            self.label_z_value.setText('z = %.2f' % z_value)
+        else:
+            self.z_slider.setVisible(False)
+            self.label_z_slider.setVisible(False)
+            self.label_z_value.setVisible(False)
+
+        # Remember how the plotted data maps onto the positions arrays,
+        # so on_click_image() can look up the spectrum for a clicked
+        # point/pixel. Covers a 1D line plot and a 2D image (which
+        # includes a single z-slice of a 3D dataset, whose dslice/idx
+        # were already pinned down to the in-plane axes above). Not set
+        # for a single 0D point or the 3D cube view, where a screen
+        # click doesn't map onto a single data point.
+        if len(idx) in (1, 2):
+            self._click_context = {'idx': tuple(idx), 'dslice': list(dslice)}
 
         try:
             if dimensionality == 0:
@@ -657,7 +826,8 @@ class EvaluationView(QtWidgets.QWidget):
                             value_min,
                             value_max
                         )
-            if dimensionality == 2:
+            if dimensionality == 2 or (dimensionality == 3
+                                       and not self.show_3d):
                 # We rotate the array so the x-axis is shown as the
                 # horizontal axis
                 image_map = data[tuple(dslice)]
@@ -670,13 +840,12 @@ class EvaluationView(QtWidgets.QWidget):
                     self.image_map.set_data(image_map)
                     self.image_map.set_extent(extent)
                 else:
-                    self.clear_plots()
+                    self._remove_image_map()
                     self.image_map = self.plot.imshow(
                         image_map, interpolation='nearest',
                         extent=extent
                     )
-                    self.colorbar =\
-                        self.mplcanvas.get_figure().colorbar(self.image_map)
+                    self._update_colorbar(self.image_map, '')
 
                 with warnings.catch_warnings():
                     warnings.filterwarnings(
@@ -707,117 +876,126 @@ class EvaluationView(QtWidgets.QWidget):
                     np.nanmin(positions[idx[1]][tuple(dslice)]),
                     np.nanmax(positions[idx[1]][tuple(dslice)])
                 )
-            if dimensionality == 3:
-                self._draw_3d_surfaces(stride=1)
+            if dimensionality == 3 and self.show_3d:
+                # dslice here still has all three spatial axes as
+                # slice(None) (only 3D-and-not-show_3d reduces it, above),
+                # so this is the actual full 3D data/positions.
+                self._draw_3d_cubes(
+                    positions[0][tuple(dslice)],
+                    positions[1][tuple(dslice)],
+                    positions[2][tuple(dslice)],
+                    data[tuple(dslice)],
+                    labels, parameter_key, parameters
+                )
 
             self.mplcanvas.draw()
         except Exception as e:
             self.reset_ui()
             raise e
 
-    def _draw_3d_surfaces(self, stride=1):
-        """
-        Renders the 3D evaluation plot from self.plot_3d_cache
-        (populated by refresh_plot()).
+    def on_z_slider_changed(self, value):
+        self.z_slice_index = value
+        self.refresh_plot()
 
-        matplotlib's mplot3d has to re-sort every polygon face on
-        every redraw (e.g. on every frame while the user drags to
-        rotate), which doesn't scale well for a dense measurement
-        grid. `stride` > 1 renders a decimated, much faster-to-rotate
-        preview by keeping only every `stride`-th slice/row/column;
-        this is used by on_3d_button_press() while actively dragging,
-        and full resolution (stride=1) is restored on mouse release
-        and by refresh_plot() otherwise.
+    def on_toggle_3d_view(self):
+        self.show_3d = not self.show_3d
+        self.button_toggle_3d.setText(
+            'Switch to 2D view' if self.show_3d else 'Switch to 3D view')
+        self.refresh_plot()
+
+    def _draw_3d_cubes(self, x, y, z, data, labels, parameter_key,
+                        parameters):
         """
-        cache = self.plot_3d_cache
-        if cache is None:
+        Renders one cuboid per measurement point, centered on its
+        actual (x, y, z) position (not a nominal/regular grid position -
+        e.g. under surface-following, z varies per (x, y) to trace the
+        found surface, and each point's real position is used as-is)
+        and sized to the median physical spacing between neighboring
+        points along each axis, so cube size reflects the real step size
+        of the scan rather than an arbitrary constant. Cuboids are drawn
+        semi-transparent unless the "Transparent Blocks" checkbox is
+        unchecked, so blocks further inside the volume remain visible.
+        """
+        valid = ~np.isnan(data)
+        if not np.any(valid):
+            self.image_map = None
             return
-        positions = cache['positions']
-        data = cache['data']
-        labels = cache['labels']
-        parameter_key = cache['parameter_key']
-        parameters = cache['parameters']
 
-        self.mplcanvas.get_figure().clf()
-        self.plot = self.mplcanvas.get_figure().add_subplot(
-            111, projection='3d')
-
-        (value_min, value_max) = self.get_plot_limits(data)
-
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                action='ignore', message='All-NaN slice encountered')
+            (value_min, value_max) = self.get_plot_limits(data)
+        if not value_min < value_max:
+            value_min, value_max = 0.0, 1.0
         scalar_map = matplotlib.cm.ScalarMappable(
             norm=Normalize(vmin=value_min, vmax=value_max),
             cmap=matplotlib.cm.viridis
         )
 
-        dslice = [slice(None) if dim > 1 else 0 for dim in data.shape]
+        def median_step(coord, axis):
+            step = np.abs(np.diff(coord, axis=axis))
+            step = step[np.isfinite(step) & (step > 0)]
+            return float(np.median(step)) if step.size else 1.0
 
-        plots = []
+        half_extent = np.array([
+            median_step(x, 0), median_step(y, 1), median_step(z, 2)
+        ]) / 2
 
-        # We slice the data along the last occurrence
-        # of the shortest dimension
-        b = data.shape[::-1]
-        axis = len(b) - np.argmin(b) - 1
+        centers = np.stack(
+            [x[valid], y[valid], z[valid]], axis=1)  # (N, 3)
 
-        for slice_idx in range(0, data.shape[axis], stride):
-            dslice[axis] = slice_idx
+        # Unit-cube corner offsets (bottom face then top face).
+        offsets = np.array([
+            [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+            [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1],
+        ], dtype=float)
+        verts = centers[:, None, :] + offsets[None, :, :] * half_extent
 
-            idx_t = tuple(dslice)
-            x = positions[0][idx_t][::stride, ::stride]
-            y = positions[1][idx_t][::stride, ::stride]
-            z = positions[2][idx_t][::stride, ::stride]
-            c = data[idx_t][::stride, ::stride]
-            if x.size == 0:
-                continue
-            s = self.plot.plot_surface(
-                x, y, z,
-                facecolors=scalar_map.to_rgba(c),
-                shade=False
+        face_corner_idx = [
+            [0, 1, 2, 3], [4, 5, 6, 7],
+            [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7],
+        ]
+        faces = verts[:, face_corner_idx, :].reshape(-1, 4, 3)
+        alpha = 0.5 if self.checkbox_transparent_blocks.isChecked() else 1.0
+        face_colors = np.repeat(
+            scalar_map.to_rgba(data[valid], alpha=alpha), 6, axis=0)
+
+        self._remove_image_map()
+        poly = Poly3DCollection(
+            faces, facecolors=face_colors, edgecolors='black',
+            linewidths=0.2
+        )
+        self.plot.add_collection3d(poly)
+        self.image_map = poly
+
+        x_min, x_max = np.nanmin(x) - half_extent[0], np.nanmax(x) + half_extent[0]
+        y_min, y_max = np.nanmin(y) - half_extent[1], np.nanmax(y) + half_extent[1]
+        z_min, z_max = np.nanmin(z) - half_extent[2], np.nanmax(z) + half_extent[2]
+        self.plot.set_xlim(x_min, x_max)
+        self.plot.set_ylim(y_min, y_max)
+        self.plot.set_zlim(z_min, z_max)
+
+        # Same "Aspect ratio" checkbox the 2D view uses (there: axis('scaled')
+        # vs axis('auto')) - here, a box aspect matching the real x/y/z extents
+        # vs mpl3d's own fixed 4:4:3 default, so unchecked looks like it always
+        # did before this box-aspect handling existed.
+        if self.aspect_ratio.isChecked():
+            box_aspect = (
+                max(x_max - x_min, 1e-9),
+                max(y_max - y_min, 1e-9),
+                max(z_max - z_min, 1e-9),
             )
-            plots.append(s)
-        self.image_map = plots
+        else:
+            box_aspect = None
+        self.plot.set_box_aspect(box_aspect)
+
         self.plot.set_xlabel(labels[0])
         self.plot.set_ylabel(labels[1])
         self.plot.set_zlabel(labels[2])
 
-        self.colorbar =\
-            self.mplcanvas.get_figure().colorbar(
-                scalar_map,
-                ax=self.plot
-            )
         cb_label = parameters[parameter_key]['symbol'] +\
             ' [' + parameters[parameter_key]['unit'] + ']'
-        self.colorbar.ax.set_title(cb_label)
-
-    @staticmethod
-    def _get_decimation_stride(shape, target_max_points=600):
-        total_points = int(np.prod(shape))
-        if total_points <= target_max_points:
-            return 1
-        return max(1, int(
-            np.ceil((total_points / target_max_points) ** (1 / 3))))
-
-    def on_3d_button_press(self, event):
-        """
-        Swaps in a decimated (faster to rotate) version of the 3D
-        plot the moment the user starts dragging inside it.
-        """
-        if self.plot_3d_cache is None:
-            return
-        if event.inaxes is not self.plot:
-            return
-        stride = self._get_decimation_stride(
-            self.plot_3d_cache['data'].shape)
-        if stride <= 1:
-            return
-        self._draw_3d_surfaces(stride=stride)
-        self.mplcanvas.draw()
-
-    def on_3d_button_release(self, event):
-        """ Restores full detail once the user stops dragging. """
-        if self.plot_3d_cache is None:
-            return
-        self._draw_3d_surfaces(stride=1)
-        self.mplcanvas.draw()
+        self._update_colorbar(scalar_map, cb_label)
 
     def get_plot_limits(self, data):
         if self.autoscale.isChecked():

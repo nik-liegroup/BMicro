@@ -1,8 +1,10 @@
 import pathlib
 from importlib import resources
 import hashlib
+import logging
 import signal
 import sys
+import time
 import traceback
 
 import numpy as np
@@ -12,7 +14,7 @@ from PyQt6.QtWidgets import QFileDialog, QMessageBox, \
     QVBoxLayout, QWidget, QCheckBox, QHBoxLayout, QLabel, QLineEdit
 from PyQt6.QtCore import QSize
 
-from bmlab.session import Session
+from bmlab.session import Session, get_session_file_path
 from bmlab.file import is_source_file
 from bmlab.models.setup import AVAILABLE_SETUPS
 from bmlab.models import EvaluationModel
@@ -28,6 +30,8 @@ from . import evaluation
 from bmicro import __version__ as bmicroversion
 from bmlab import __version__ as bmlabversion
 
+logger = logging.getLogger(__name__)
+
 
 def check_event_mime_data(event):
     """ Returns the path to local file if h5 file """
@@ -38,6 +42,58 @@ def check_event_mime_data(event):
             if path.endswith(".h5"):
                 return path
     return False
+
+
+class ExportWorker(QtCore.QObject):
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, configuration):
+        super().__init__()
+        self.configuration = configuration
+
+    def run(self):
+        try:
+            ExportController().export(self.configuration)
+        except Exception:
+            logger.warning('Export failed', exc_info=True)
+        finally:
+            self.finished.emit()
+
+
+class BatchExportWorker(QtCore.QObject):
+    progress = QtCore.pyqtSignal(int, str)
+    finished = QtCore.pyqtSignal(int, list)
+
+    def __init__(self, files, configuration):
+        super().__init__()
+        self.files = files
+        self.configuration = configuration
+        self.aborted = False
+
+    def run(self):
+        session = Session.get_instance()
+        succeeded = 0
+        failed = []
+        for i, file_path in enumerate(self.files):
+            if self.aborted:
+                break
+            self.progress.emit(i + 1, str(file_path))
+            try:
+                # Sessions carry state (crop, orientation, etc.) that
+                # must be cleared before pointing at a new file - see
+                # BMicro.open_file()/close_file().
+                session.clear()
+                session.set_file(file_path)
+                ExportController().export(self.configuration)
+            except Exception:
+                logger.warning(
+                    'Batch export failed for %s', file_path,
+                    exc_info=True)
+                failed.append(file_path)
+            else:
+                succeeded += 1
+        session.clear()
+        self.finished.emit(succeeded, failed)
 
 
 class BMicro(QtWidgets.QMainWindow):
@@ -78,6 +134,13 @@ class BMicro(QtWidgets.QMainWindow):
         self.export_dialog = None
         # Initialize the export configuration
         self.export_config = ExportController.get_configuration()
+        self.export_thread = None
+        self.export_worker = None
+        self.export_running = False
+        self.batch_export_dialog = None
+        self.batch_export_progress_dialog = None
+        self.batch_export_thread = None
+        self.batch_export_worker = None
 
         self.batch_dialog = None
         self.batch_files = {}
@@ -161,6 +224,8 @@ class BMicro(QtWidgets.QMainWindow):
         self.action_about.triggered.connect(self.on_action_about)
         self.action_batch_evaluation.triggered.connect(
             self.on_action_batch_evaluation)
+        self.action_batch_export.triggered.connect(
+            self.on_action_batch_export)
 
     def open_file(self, file_name=None):
         """ Show open file dialog and load file. """
@@ -207,41 +272,47 @@ class BMicro(QtWidgets.QMainWindow):
         self.reset_ui()
 
     def on_action_export_file(self):
-        self.export_dialog = QtWidgets.QDialog(
+        self.export_dialog = self._build_export_config_dialog(
+            'Export configuration', self.export_file)
+        self.export_dialog.open()
+
+    def _build_export_config_dialog(self, title, on_export):
+        """
+        Builds the "what to export" dialog (the checkboxes for
+        overview brightfield / surface / per-parameter Brillouin maps
+        etc.), shared between the single-file export and batch export
+        entry points. `on_export` is called (with no arguments) when
+        the dialog's Export button is clicked.
+        """
+        dialog = QtWidgets.QDialog(
             self,
             QtCore.Qt.WindowType.WindowTitleHint |
             QtCore.Qt.WindowType.WindowCloseButtonHint
         )
         ref = resources.files('bmicro.gui') / 'export_configuration.ui'
         with resources.as_file(ref) as ui_file:
-            uic.loadUi(ui_file, self.export_dialog)
-        self.export_dialog.setWindowTitle('Export configuration')
-        self.export_dialog.setWindowModality(
+            uic.loadUi(ui_file, dialog)
+        dialog.setWindowTitle(title)
+        dialog.setWindowModality(
             QtCore.Qt.WindowModality.ApplicationModal)
-        self.export_dialog.button_export.clicked.connect(
-            self.export_file
-        )
-        self.export_dialog.button_cancel.clicked.connect(
-            self.close_export_dialog
-        )
-        self.init_export_dialog(self.export_dialog.widget)
+        dialog.button_export.clicked.connect(lambda: on_export())
+        dialog.button_cancel.clicked.connect(dialog.close)
+        self.init_export_dialog(dialog.widget)
 
-        checkbox_overview = \
-            self.export_dialog.checkbox_export_overview_brightfield
+        checkbox_overview = dialog.checkbox_export_overview_brightfield
         checkbox_overview.setChecked(
             self.export_config['overviewBrightfield']['export'])
         checkbox_overview.toggled.connect(
             self.on_export_overview_brightfield_checkbox)
 
-        checkbox_surface = self.export_dialog.checkbox_export_surface
+        checkbox_surface = dialog.checkbox_export_surface
         checkbox_surface.setChecked(
             self.export_config['surface']['export'])
         checkbox_surface.toggled.connect(
             self.on_export_surface_checkbox)
 
-        self.export_dialog.resize(QSize(500, 560))
-
-        self.export_dialog.open()
+        dialog.resize(QSize(500, 560))
+        return dialog
 
     def on_export_overview_brightfield_checkbox(self, checked):
         self.export_config['overviewBrightfield']['export'] = checked
@@ -356,8 +427,149 @@ class BMicro(QtWidgets.QMainWindow):
     def close_export_dialog(self):
         self.export_dialog.close()
 
-    def export_file(self):
-        ExportController().export(self.export_config)
+    def export_file(self, blocking=False):
+        if self.export_running:
+            return
+        self.export_running = True
+        self.statusbar.showMessage('Exporting...')
+        # Close the configuration dialog now - the export itself runs
+        # in the background, so it shouldn't keep blocking the app.
+        if self.export_dialog is not None:
+            self.close_export_dialog()
+
+        self.export_thread = QtCore.QThread()
+        self.export_worker = ExportWorker(self.export_config)
+        self.export_worker.moveToThread(self.export_thread)
+        self.export_thread.started.connect(self.export_worker.run)
+        self.export_worker.finished.connect(self.export_thread.quit)
+        self.export_worker.finished.connect(self.export_worker.deleteLater)
+        self.export_worker.finished.connect(self.on_export_finished)
+        self.export_thread.finished.connect(self.export_thread.deleteLater)
+        self.export_thread.start()
+
+        if blocking:
+            while self.export_running:
+                QtCore.QCoreApplication.instance().processEvents()
+                time.sleep(0.1)
+
+    def on_export_finished(self):
+        self.export_running = False
+        self.statusbar.showMessage('Export complete', 5000)
+
+    def on_action_batch_export(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, 'Select a folder to search for evaluated files')
+        if not folder:
+            return
+
+        files = self._find_evaluated_files(pathlib.Path(folder))
+        if not files:
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.setText('No evaluated files found.')
+            msg.setInformativeText(
+                'Looked for saved evaluations (*.session.h5 files) '
+                'under:\n' + folder)
+            msg.setWindowTitle('Batch export')
+            msg.exec()
+            return
+
+        self.batch_export_dialog = self._build_export_config_dialog(
+            f'Batch export configuration ({len(files)} files found)',
+            lambda: self._run_batch_export(files))
+        self.batch_export_dialog.open()
+
+    @staticmethod
+    def _find_evaluated_files(root):
+        """
+        Recursively finds source data files under `root` that have a
+        saved evaluation next to them (see bmlab.session.save() /
+        get_session_file_path() - depending on the source file's
+        folder layout, this is either a sibling "*.session.h5" file
+        or a same-named file in a sibling "EvalData" folder).
+        """
+        files = []
+        for candidate in sorted(root.rglob('*.h5')):
+            try:
+                if not is_source_file(candidate):
+                    continue
+            except Exception:
+                continue
+            if get_session_file_path(candidate).exists():
+                files.append(candidate)
+        return files
+
+    def _run_batch_export(self, files):
+        if self.batch_export_dialog is not None:
+            self.batch_export_dialog.close()
+
+        self.batch_export_progress_dialog = QtWidgets.QDialog(
+            self,
+            QtCore.Qt.WindowType.WindowTitleHint |
+            QtCore.Qt.WindowType.WindowCloseButtonHint
+        )
+        self.batch_export_progress_dialog.setWindowTitle('Batch export')
+        self.batch_export_progress_dialog.setWindowModality(
+            QtCore.Qt.WindowModality.ApplicationModal)
+        label = QLabel(f'File 0 / {len(files)}')
+        label.setWordWrap(True)
+        progress_bar = QtWidgets.QProgressBar()
+        progress_bar.setMaximum(len(files))
+        progress_bar.setValue(0)
+        button_cancel = QtWidgets.QPushButton('Cancel')
+        layout = QVBoxLayout()
+        layout.addWidget(label)
+        layout.addWidget(progress_bar)
+        layout.addWidget(button_cancel)
+        self.batch_export_progress_dialog.setLayout(layout)
+        self.batch_export_progress_dialog.resize(QSize(500, 120))
+
+        self.batch_export_thread = QtCore.QThread()
+        self.batch_export_worker = BatchExportWorker(
+            files, self.export_config)
+        self.batch_export_worker.moveToThread(self.batch_export_thread)
+        self.batch_export_thread.started.connect(
+            self.batch_export_worker.run)
+        self.batch_export_thread.finished.connect(
+            self.batch_export_thread.deleteLater)
+
+        def on_progress(i, path):
+            label.setText(f'File {i} / {len(files)}\n{path}')
+            progress_bar.setValue(i)
+
+        def on_finished(succeeded, failed):
+            aborted = self.batch_export_worker.aborted
+            self.batch_export_thread.quit()
+            self.batch_export_worker.deleteLater()
+            self.batch_export_progress_dialog.close()
+            Session.get_instance().clear()
+            self.reset_ui()
+
+            summary = QMessageBox()
+            summary.setIcon(
+                QMessageBox.Icon.Warning if failed
+                else QMessageBox.Icon.Information)
+            summary.setWindowTitle('Batch export')
+            if aborted:
+                summary.setText(
+                    f'Batch export cancelled after '
+                    f'{succeeded}/{len(files)} files.')
+            else:
+                summary.setText(
+                    f'Batch export finished: '
+                    f'{succeeded}/{len(files)} succeeded.')
+            if failed:
+                summary.setInformativeText(
+                    'Failed:\n' + '\n'.join(str(f) for f in failed))
+            summary.exec()
+
+        self.batch_export_worker.progress.connect(on_progress)
+        self.batch_export_worker.finished.connect(on_finished)
+        button_cancel.clicked.connect(
+            lambda: setattr(self.batch_export_worker, 'aborted', True))
+
+        self.batch_export_progress_dialog.show()
+        self.batch_export_thread.start()
 
     def reset_ui(self):
         """
@@ -1041,7 +1253,7 @@ class BMicro(QtWidgets.QMainWindow):
                 if self.aborted(file):
                     return
                 QtCore.QCoreApplication.instance().processEvents()
-                self.export_file()
+                self.export_file(blocking=True)
 
         # Save the evaluated data
         self.save_session()

@@ -51,6 +51,14 @@ class PeakSelectionView(QtWidgets.QWidget):
         self.button_rayleigh_clear.released.connect(
             self.clear_regions)
 
+        # Which measurement position's spectrum is shown for peak
+        # selection - see refresh_plot(). Lets the user step to a
+        # different position if the current one doesn't show the peaks
+        # clearly enough to select regions on.
+        self.spectrum_index = 0
+        self.button_prev_spectrum.clicked.connect(self.on_prev_spectrum)
+        self.button_next_spectrum.clicked.connect(self.on_next_spectrum)
+
         self.mode = MODE_DEFAULT
 
         self.table_Brillouin_regions.itemChanged.connect(
@@ -68,8 +76,18 @@ class PeakSelectionView(QtWidgets.QWidget):
     def reset_ui(self):
         self.table_Brillouin_regions.setRowCount(0)
         self.table_Rayleigh_regions.setRowCount(0)
+        self.spectrum_index = 0
+        self.label_spectrum_index.setText('Position 0 / 0')
         self.plot.cla()
         self.mplcanvas.draw()
+
+    def on_prev_spectrum(self):
+        self.spectrum_index = max(0, self.spectrum_index - 1)
+        self.refresh_plot()
+
+    def on_next_spectrum(self):
+        self.spectrum_index += 1
+        self.refresh_plot()
 
     def on_select_brillouin_clicked(self):
         if self.mode == MODE_SELECT_BRILLOUIN:
@@ -130,9 +148,24 @@ class PeakSelectionView(QtWidgets.QWidget):
         try:
             image_keys = session.get_image_keys()
             if not image_keys:
+                self.label_spectrum_index.setText('Position 0 / 0')
+                self.button_prev_spectrum.setEnabled(False)
+                self.button_next_spectrum.setEnabled(False)
                 return
+
+            # Clamp in case the number of positions changed (e.g. a new
+            # file was loaded) since the index was last set.
+            self.spectrum_index = min(
+                self.spectrum_index, len(image_keys) - 1)
+            self.label_spectrum_index.setText(
+                'Position %d / %d' %
+                (self.spectrum_index + 1, len(image_keys)))
+            self.button_prev_spectrum.setEnabled(self.spectrum_index > 0)
+            self.button_next_spectrum.setEnabled(
+                self.spectrum_index < len(image_keys) - 1)
+
             spectra, times, _ = evc.extract_spectra(
-                image_keys[0]
+                image_keys[self.spectrum_index]
             )
             if spectra is None:
                 return

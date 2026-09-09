@@ -66,18 +66,29 @@ def test_export_surface_and_overview_brightfield(qtbot, mocker, tmp_path):
     window.export_config['fluorescenceCombined']['export'] = False
     window.export_config['brillouin']['export'] = False
 
-    window.export_file()
+    # Export runs on a background thread (see BMicro.export_file) - block
+    # here so the assertions below don't race it.
+    window.export_file(blocking=True)
 
     # SurfaceScan.h5 is not inside a 'RawData' folder here, so bmlab's
     # exporters write directly next to the source file (see e.g.
     # FluorescenceExport.export / SurfaceExport._plot_path).
     assert (
-        tmp_path / 'SurfaceScan_BMrep0_surface_found_mask.png').exists()
+        tmp_path / 'surface_BMrep0_z_surface.png').exists()
+    # SurfaceScan.h5 predates the coarse pre-scan point datasets, so
+    # no prescan_points plot should be produced for it.
+    assert not (
+        tmp_path
+        / 'surface_BMrep0_prescan_points.png').exists()
+    # 2 z-planes x 2 tiles each - one tiled-mosaic file per z-plane.
     assert (
         tmp_path
-        / 'SurfaceScan_FLrep0_overviewBrightfield_000.png').exists()
+        / 'overviewZStack_0_BMrep0_afterAcq_tiled.tif').exists()
     assert (
-        tmp_path / 'SurfaceScan_BMrep0_surface_metrics.json').exists()
+        tmp_path
+        / 'overviewZStack_1_BMrep0_afterAcq_tiled.tif').exists()
+    assert (
+        tmp_path / 'surface_BMrep0_metrics.json').exists()
 
     Session.get_instance().clear()
     window.close()

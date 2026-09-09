@@ -223,7 +223,27 @@
           <property name="bottomMargin">
            <number>0</number>
           </property>
-          <item row="1" column="1">
+          <item row="0" column="0" colspan="2">
+           <widget class="QCheckBox" name="checkbox_use_zoom_as_crop">
+            <property name="toolTip">
+             <string>When checked, restricts extraction/calibration/evaluation for the whole file to the currently zoomed-in region of the image below. Zoom in first using the plot toolbar, then check this box.</string>
+            </property>
+            <property name="text">
+             <string>Use current zoom as crop for all analysis</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="0" colspan="2">
+           <widget class="QLabel" name="label_zoom_bounds">
+            <property name="toolTip">
+             <string>Live pixel bounds of the current plot zoom (updates as you zoom/pan below) - compare against BrillouinAcquisition's own ROI panel (Left/Top/Width/Height) to line up the same physical region.</string>
+            </property>
+            <property name="text">
+             <string>Zoom: x [0, 0]  y [0, 0]</string>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="1">
            <widget class="QPushButton" name="button_select_done">
             <property name="minimumSize">
              <size>
@@ -236,7 +256,7 @@
             </property>
            </widget>
           </item>
-          <item row="2" column="1">
+          <item row="3" column="1">
            <widget class="QPushButton" name="button_optimize">
             <property name="minimumSize">
              <size>
@@ -249,7 +269,7 @@
             </property>
            </widget>
           </item>
-          <item row="1" column="0">
+          <item row="2" column="0">
            <widget class="QPushButton" name="button_clear">
             <property name="minimumSize">
              <size>
@@ -262,7 +282,7 @@
             </property>
            </widget>
           </item>
-          <item row="2" column="0">
+          <item row="3" column="0">
            <widget class="QPushButton" name="button_find_points">
             <property name="text">
              <string>Find Peaks</string>
