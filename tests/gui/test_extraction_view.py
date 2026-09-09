@@ -101,3 +101,40 @@ def test_clicking_find_points_finds_points(qtbot, window):
 
     ev.find_points()
     assert len(session.extraction_model().get_points('1')) > 0
+
+
+def test_checking_use_zoom_as_crop_restricts_analysis(qtbot, window):
+    ev = window.widget_extraction_view
+    session = Session.get_instance()
+
+    full_shape = session.get_payload_image('1', 0).shape
+    assert session.get_crop_bounds() is None
+
+    # Simulate the user zooming into a sub-region with the plot's Zoom
+    # tool, then checking the box to lock that in as the crop.
+    ev.image_plot.set_xlim(50, 250)
+    ev.image_plot.set_ylim(100, 300)
+    ev.checkbox_use_zoom_as_crop.setChecked(True)
+
+    assert session.get_crop_bounds() == (50, 250, 100, 300)
+    cropped_shape = session.get_payload_image('1', 0).shape
+    assert cropped_shape == (200, 200)
+    assert cropped_shape != full_shape
+
+    # Unchecking restores the full image.
+    ev.checkbox_use_zoom_as_crop.setChecked(False)
+    assert session.get_crop_bounds() is None
+    assert session.get_payload_image('1', 0).shape == full_shape
+
+
+def test_zoom_label_updates_live_with_plot_zoom(qtbot, window):
+    ev = window.widget_extraction_view
+
+    ev.image_plot.set_xlim(50, 250)
+    ev.image_plot.set_ylim(100, 300)
+    assert ev.label_zoom_bounds.text() == 'Zoom: x [50, 250]  y [100, 300]'
+
+    # Updates again on a further zoom, without needing setChecked/refresh.
+    ev.image_plot.set_xlim(0, 400)
+    ev.image_plot.set_ylim(0, 400)
+    assert ev.label_zoom_bounds.text() == 'Zoom: x [0, 400]  y [0, 400]'
