@@ -855,16 +855,6 @@
                     </layout>
                    </item>
                    <item>
-                    <widget class="QCheckBox" name="checkBox_quality_reset_defaults">
-                     <property name="text">
-                      <string>Reset quality thresholds to data-driven defaults</string>
-                     </property>
-                     <property name="checked">
-                      <bool>false</bool>
-                     </property>
-                    </widget>
-                   </item>
-                   <item>
                     <widget class="QGroupBox" name="nrBrillouinPeaksGroup">
                      <property name="maximumSize">
                       <size>
@@ -997,6 +987,40 @@
                  </widget>
                 </item>
                 <item>
+                 <widget class="QGroupBox" name="group_5b_quality">
+                  <property name="title">
+                   <string>Quality</string>
+                  </property>
+                  <layout class="QVBoxLayout" name="verticalLayout_14">
+                   <property name="leftMargin">
+                    <number>9</number>
+                   </property>
+                   <property name="topMargin">
+                    <number>4</number>
+                   </property>
+                   <property name="rightMargin">
+                    <number>9</number>
+                   </property>
+                   <property name="bottomMargin">
+                    <number>4</number>
+                   </property>
+                   <item>
+                    <widget class="QLabel" name="label_quality_hint">
+                     <property name="text">
+                      <string>Applied to each file right after evaluating it (writes quality_pass, same as &quot;Apply to results&quot; on the Quality tab):</string>
+                     </property>
+                     <property name="wordWrap">
+                      <bool>true</bool>
+                     </property>
+                    </widget>
+                   </item>
+                   <item>
+                    <widget class="QWidget" name="widget_quality_rows" native="true"/>
+                   </item>
+                  </layout>
+                 </widget>
+                </item>
+                <item>
                  <widget class="QGroupBox" name="group_6_export">
                   <property name="title">
                    <string>Export</string>
@@ -1036,16 +1060,6 @@
                       </widget>
                      </item>
                     </layout>
-                   </item>
-                   <item>
-                    <widget class="QWidget" name="widget_parameters" native="true">
-                     <property name="minimumSize">
-                      <size>
-                       <width>0</width>
-                       <height>470</height>
-                      </size>
-                     </property>
-                    </widget>
                    </item>
                   </layout>
                  </widget>

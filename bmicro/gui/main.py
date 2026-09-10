@@ -1,17 +1,17 @@
 import pathlib
 from importlib import resources
+import copy
 import hashlib
 import logging
 import signal
 import sys
-import time
 import traceback
 
 import numpy as np
 
 from PyQt6 import QtWidgets, uic, QtCore, QtGui
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, \
-    QVBoxLayout, QCheckBox, QLabel
+    QVBoxLayout, QHBoxLayout, QCheckBox, QLabel, QDoubleSpinBox, QWidget
 from PyQt6.QtCore import QSize
 
 from bmlab.session import Session, get_session_file_path
@@ -172,19 +172,26 @@ class BMicro(QtWidgets.QMainWindow):
                 'nr_brillouin_peaks': 1,
                 'bounds_w0': None,
                 'bounds_fwhm': None,
-                # If set, each file's quality_thresholds are reset to
-                # EvaluationModel.get_default_quality_thresholds()
-                # after evaluating - lets a batch run bring older
-                # files (saved before that method existed, or with no
-                # thresholds at all) up to the current defaults,
-                # rather than leaving them untouched.
-                'reset_quality_thresholds': False,
             },
+            # Applied to every file right after it's evaluated (see
+            # evaluate_batch_file()) - same thresholds/metrics as the
+            # Quality tab (EvaluationController.QUALITY_METRIC_KEYS),
+            # prefilled with EvaluationModel.get_default_quality_
+            # thresholds() and editable in the "Quality" section of
+            # the batch dialog (see _build_batch_quality_rows()).
+            # Unlike the other sections here, this isn't optional/
+            # gated by its own checkbox: whatever is set here always
+            # replaces each file's own saved thresholds and is applied
+            # (evc.apply_quality_thresholds(), writing quality_pass)
+            # whenever "Evaluate" is ticked.
+            'quality': copy.deepcopy(
+                EvaluationModel.get_default_quality_thresholds()),
             'export': {
                 'export': False,
             },
         }
         self.batch_evaluation_running = False
+        self.batch_evaluation_messages = []
 
         # Build tabs
         self.widget_data_view = data.DataView(self)
@@ -308,11 +315,10 @@ class BMicro(QtWidgets.QMainWindow):
 
         There is no per-parameter choice here (and none in the "Batch
         evaluation" wizard's own export step either - see
-        on_action_batch_evaluation()): BrillouinExport now always
-        writes every evaluated quantity into one combined CSV per
-        repetition, so `self.export_config['brillouin']['parameters']`
-        is fixed to "every parameter" for this dialog rather than left
-        for the user to narrow down.
+        on_action_batch_evaluation()): BrillouinExport always writes
+        every evaluated quantity into one combined CSV per repetition
+        (no more per-parameter Plots/Bare and Plots/WithAxis image
+        files) - there's nothing left to narrow down.
 
         `repetition_keys`, for the single-file export entry point, is
         the currently open file's own Brillouin repetition keys (e.g.
@@ -337,8 +343,6 @@ class BMicro(QtWidgets.QMainWindow):
             QtCore.Qt.WindowModality.ApplicationModal)
         dialog.button_export.clicked.connect(lambda: on_export())
         dialog.button_cancel.clicked.connect(dialog.close)
-        self.export_config['brillouin']['parameters'] = list(
-            EvaluationModel.get_default_parameters())
         self.init_export_repetitions(dialog.groupBox_repetitions,
                                      repetition_keys)
 
@@ -433,9 +437,11 @@ class BMicro(QtWidgets.QMainWindow):
         self.export_thread.start()
 
         if blocking:
-            while self.export_running:
-                QtCore.QCoreApplication.instance().processEvents()
-                time.sleep(0.1)
+            # A real Qt event loop, not a manual processEvents()+sleep()
+            # poll - see the matching comment in EvaluationView.evaluate().
+            loop = QtCore.QEventLoop()
+            self.export_worker.finished.connect(loop.quit)
+            loop.exec()
 
     def on_export_finished(self):
         self.export_running = False
@@ -656,15 +662,11 @@ class BMicro(QtWidgets.QMainWindow):
         # Batch evaluation's export step reuses the same export_config
         # as the regular Export/Batch export dialogs (see
         # _build_export_config_dialog()) and behaves the same way now:
-        # every parameter and every repetition, no per-file choice -
-        # there used to be a per-parameter checkbox list here, but it
-        # only affected the (long-superseded) per-parameter image-plot
-        # export, never the combined CSV, and nothing else in the app
-        # still exposes that choice either.
-        self.export_config['brillouin']['parameters'] = list(
-            EvaluationModel.get_default_parameters())
+        # every evaluated quantity, every repetition, no per-file
+        # choice.
         self.export_config['brillouin']['repetitions'] = None
-        self.batch_dialog.widget_parameters.setVisible(False)
+
+        self._build_batch_quality_rows()
         self.batch_dialog.adjustSize()
 
         self.update_batch_file_settings()
@@ -673,6 +675,99 @@ class BMicro(QtWidgets.QMainWindow):
 
     def close_batch_dialog(self):
         self.batch_dialog.close()
+
+    def _build_batch_quality_rows(self):
+        """
+        Populates the batch dialog's "Quality" section with one row
+        per EvaluationController.QUALITY_METRIC_KEYS - a nicely
+        labelled checkbox+spinbox pair for min and max, same as
+        QualityView's own metric rows, prefilled from
+        self.batch_config['quality'] (which starts at
+        EvaluationModel.get_default_quality_thresholds() - see
+        __init__). Rebuilt from scratch every time the dialog opens,
+        so it always reflects the current batch_config state (which
+        persists across dialog opens within this app run).
+        """
+        parameters = EvaluationModel.get_default_parameters()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        self._batch_quality_rows = {}
+        for key in EvaluationController.QUALITY_METRIC_KEYS:
+            threshold = self.batch_config['quality'].get(
+                key, {'enabled': True, 'min': None, 'max': None})
+            param = parameters.get(key, {})
+            unit = f" [{param['unit']}]" \
+                if param.get('unit') else ''
+            label_text = f"{param.get('label', key)}{unit}"
+
+            row_layout = QHBoxLayout()
+            label = QLabel(label_text)
+            label.setMinimumWidth(260)
+            row_layout.addWidget(label)
+
+            min_check = QCheckBox('min')
+            min_box = QDoubleSpinBox()
+            min_box.setRange(-1e9, 1e9)
+            min_box.setDecimals(4)
+            min_box.setMaximumWidth(100)
+            has_min = threshold.get('min') is not None
+            min_check.setChecked(has_min)
+            min_box.setEnabled(has_min)
+            if has_min:
+                min_box.setValue(threshold['min'])
+            row_layout.addWidget(min_check)
+            row_layout.addWidget(min_box)
+
+            max_check = QCheckBox('max')
+            max_box = QDoubleSpinBox()
+            max_box.setRange(-1e9, 1e9)
+            max_box.setDecimals(4)
+            max_box.setMaximumWidth(100)
+            has_max = threshold.get('max') is not None
+            max_check.setChecked(has_max)
+            max_box.setEnabled(has_max)
+            if has_max:
+                max_box.setValue(threshold['max'])
+            row_layout.addWidget(max_check)
+            row_layout.addWidget(max_box)
+            row_layout.addStretch()
+
+            row_widget = QWidget()
+            row_widget.setLayout(row_layout)
+            layout.addWidget(row_widget)
+
+            min_check.toggled.connect(min_box.setEnabled)
+            max_check.toggled.connect(max_box.setEnabled)
+            min_check.toggled.connect(
+                lambda checked, k=key: self.on_batch_quality_changed(k))
+            max_check.toggled.connect(
+                lambda checked, k=key: self.on_batch_quality_changed(k))
+            min_box.valueChanged.connect(
+                lambda value, k=key: self.on_batch_quality_changed(k))
+            max_box.valueChanged.connect(
+                lambda value, k=key: self.on_batch_quality_changed(k))
+
+            self._batch_quality_rows[key] = {
+                'min_check': min_check, 'min_box': min_box,
+                'max_check': max_check, 'max_box': max_box,
+            }
+
+        # setLayout() only works once per widget - the dialog is
+        # rebuilt from the .ui file (a fresh widget_quality_rows) each
+        # time on_action_batch_evaluation() runs, so this is safe.
+        self.batch_dialog.widget_quality_rows.setLayout(layout)
+
+    def on_batch_quality_changed(self, key):
+        row = self._batch_quality_rows[key]
+        min_value = row['min_box'].value() \
+            if row['min_check'].isChecked() else None
+        max_value = row['max_box'].value() \
+            if row['max_check'].isChecked() else None
+        self.batch_config['quality'][key] = {
+            'enabled': True, 'min': min_value, 'max': max_value,
+        }
 
     def update_batch_file_settings(self):
         # Setup
@@ -832,13 +927,9 @@ class BMicro(QtWidgets.QMainWindow):
             .setChecked(cfg_evaluation['evaluate'])
         self.batch_dialog.checkBox_evaluation\
             .clicked.connect(self.on_evaluation_evaluate)
-        self.batch_dialog.checkBox_quality_reset_defaults.setChecked(
-            cfg_evaluation['reset_quality_thresholds'])
-        self.batch_dialog.checkBox_quality_reset_defaults.clicked.connect(
-            self.on_quality_reset_defaults)
-        self.batch_dialog.checkBox_quality_reset_defaults\
-            .setEnabled(cfg_evaluation['evaluate'])
         self.batch_dialog.nrBrillouinPeaksGroup\
+            .setEnabled(cfg_evaluation['evaluate'])
+        self.batch_dialog.group_5b_quality\
             .setEnabled(cfg_evaluation['evaluate'])
         if cfg_evaluation['nr_brillouin_peaks'] == 1:
             self.batch_dialog.nrBrillouinPeaks_1.setChecked(True)
@@ -1113,16 +1204,12 @@ class BMicro(QtWidgets.QMainWindow):
             = self.sender().isChecked()
         self.batch_dialog.nrBrillouinPeaksGroup\
             .setEnabled(self.batch_config['evaluation']['evaluate'])
-        self.batch_dialog.checkBox_quality_reset_defaults\
+        self.batch_dialog.group_5b_quality\
             .setEnabled(self.batch_config['evaluation']['evaluate'])
         self.batch_dialog.bounds_table\
             .setEnabled(
                 self.batch_config['evaluation']['evaluate'] and
                 self.batch_config['evaluation']['nr_brillouin_peaks'] > 1)
-
-    def on_quality_reset_defaults(self):
-        self.batch_config['evaluation']['reset_quality_thresholds']\
-            = self.sender().isChecked()
 
     def on_export_export(self):
         self.batch_config['export']['export'] = self.sender().isChecked()
@@ -1152,19 +1239,43 @@ class BMicro(QtWidgets.QMainWindow):
         self.batch_dialog.button_start_cancel.setText('Cancel')
         self.batch_dialog.progressBar.setMaximum(len(self.batch_files))
         self.batch_dialog.progressBar.setValue(0)
+        # Collects every problem hit along the way - both a whole file
+        # failing (an exception escaping evaluate_batch_file()) and a
+        # single repetition being skipped within an otherwise-fine
+        # file (see the calibration/peak-selection checks in
+        # evaluate_batch_file()) - so they can be shown to the user at
+        # the end instead of only ever showing up as an unexplained
+        # "failed" icon in the file table.
+        self.batch_evaluation_messages = []
         for i, (file_hash, file) in enumerate(self.batch_files.items()):
             try:
                 self.evaluate_batch_file(file)
-            except BaseException:
+            except BaseException as e:
                 # Set the status as failed
                 file['status'] = 'failed'
                 self.update_batch_file_table()
+                self.batch_evaluation_messages.append(
+                    f"{file['path']}: {e}")
+                logger.warning(
+                    'Batch evaluation failed for %s', file['path'],
+                    exc_info=True)
             if not self.batch_evaluation_running:
                 break
             self.batch_dialog.progressBar.setValue(i + 1)
         self.batch_dialog.button_start_cancel.setText('Start')
         self.batch_evaluation_running = False
         self.update_batch_file_table()
+
+        if self.batch_evaluation_messages:
+            summary = QMessageBox()
+            summary.setIcon(QMessageBox.Icon.Warning)
+            summary.setWindowTitle('Batch evaluation')
+            summary.setText(
+                f'{len(self.batch_evaluation_messages)} issue(s) during '
+                f'batch evaluation:')
+            summary.setInformativeText(
+                '\n\n'.join(self.batch_evaluation_messages))
+            summary.exec()
 
     def evaluate_batch_file(self, file):
         # Set the status as in process
@@ -1254,31 +1365,45 @@ class BMicro(QtWidgets.QMainWindow):
                     return
                 QtCore.QCoreApplication.instance().processEvents()
 
+                # A repetition with no valid measurement grid at all
+                # (an aborted/restarted acquisition that never wrote
+                # any positions) has nothing to evaluate - skip it
+                # quietly, same as the rest of the pipeline already
+                # does for it elsewhere (e.g. BrillouinExport.export()).
+                if session.get_payload_resolution() is None:
+                    continue
+
                 # If "Select peaks"/"Calibrate" aren't ticked for this
                 # batch run, evaluation relies entirely on whatever was
                 # already saved for this file (see set_file()/load() -
                 # loaded before this loop, in open_file() above). A
-                # file with neither would otherwise fit silently
-                # against undefined regions/calibration - fail loudly
-                # instead (caught by run_batch_evaluation(), which
-                # marks this file 'failed' and moves on).
+                # repetition with neither would otherwise fit silently
+                # against undefined regions/calibration - skip just
+                # this repetition instead (a multi-repetition file can
+                # easily have one aborted/never-finished repetition
+                # alongside perfectly good ones, so one bad repetition
+                # must not stop the rest of the file from being
+                # evaluated/exported), and record why so it shows up
+                # in the summary run_batch_evaluation() shows at the
+                # end rather than silently producing an empty result.
                 pm = session.peak_selection_model()
+                cm = session.calibration_model()
+                missing = []
                 if not pm.get_brillouin_regions() \
                         or not pm.get_rayleigh_regions():
-                    raise RuntimeError(
-                        f"Repetition {rep_key} of {file['path']} has "
-                        f"no Brillouin/Rayleigh peak regions selected, "
-                        f"and 'Select peaks' isn't ticked to define "
-                        f"them for this batch run - refusing to "
-                        f"evaluate against undefined regions.")
-                cm = session.calibration_model()
+                    missing.append(
+                        "no Brillouin/Rayleigh peak regions selected "
+                        "('Select peaks' isn't ticked to define them "
+                        "for this batch run)")
                 if cm.frequencies_by_time_interpolator is None:
-                    raise RuntimeError(
-                        f"Repetition {rep_key} of {file['path']} has "
-                        f"no valid calibration, and 'Calibrate' isn't "
-                        f"ticked to create one for this batch run - "
-                        f"refusing to evaluate without a frequency "
-                        f"calibration.")
+                    missing.append(
+                        "no valid calibration ('Calibrate' isn't "
+                        "ticked to create one for this batch run)")
+                if missing:
+                    self.batch_evaluation_messages.append(
+                        f"{file['path']} repetition {rep_key}: "
+                        f"skipped evaluation - {'; '.join(missing)}.")
+                    continue
 
                 evc = EvaluationController()
                 evc.set_nr_brillouin_peaks(
@@ -1286,23 +1411,48 @@ class BMicro(QtWidgets.QMainWindow):
                 evc.set_bounds(cfg_evaluation['bounds_w0'])
                 evc.set_bounds_fwhm(cfg_evaluation['bounds_fwhm'])
                 self.widget_evaluation_view.evaluate(blocking=True)
-                if cfg_evaluation['reset_quality_thresholds']:
-                    session.evaluation_model().quality_thresholds = \
-                        EvaluationModel.get_default_quality_thresholds()
-                # Writes evm.results['quality_pass'] from whatever
-                # quality_thresholds this file now has (just reset to
-                # the defaults above, or its own previously saved/
-                # default ones) - same as clicking "Apply to results"
-                # on the Quality tab, so it's exported/saved without
-                # requiring a manual step per file.
+                # The "Quality" section's thresholds (see
+                # _build_batch_quality_rows()) apply to every file in
+                # the batch, replacing whatever that file had saved -
+                # then write evm.results['quality_pass'] from them,
+                # same as clicking "Apply to results" on the Quality
+                # tab, so it's exported/saved without a manual step
+                # per file.
+                session.evaluation_model().quality_thresholds = \
+                    copy.deepcopy(self.batch_config['quality'])
                 evc.apply_quality_thresholds()
 
-            cfg_export = self.batch_config['export']
-            if cfg_export['export']:
-                if self.aborted(file):
-                    return
-                QtCore.QCoreApplication.instance().processEvents()
-                self.export_file(blocking=True)
+        # Export - once per file, after every repetition has been
+        # evaluated, not once per repetition inside the loop above:
+        # BrillouinExport.export() already exports every repetition of
+        # the file in one pass (export_config['brillouin']
+        # ['repetitions'] is None - see on_action_batch_evaluation()),
+        # so exporting per-repetition was both redundant and, worse,
+        # skipped entirely whenever a repetition hit one of the
+        # `continue`s above (a repetition skipped for missing
+        # calibration/peak-selection would take that iteration's
+        # export with it, even for a file where a LATER repetition
+        # still needed exporting). This also calls ExportController
+        # directly and synchronously - the same way the standalone
+        # Batch Export feature's BatchExportWorker.run() does it -
+        # instead of going through the interactive export_file()'s own
+        # QThread, which exists for keeping the single-file dialog
+        # responsive and isn't needed here.
+        cfg_export = self.batch_config['export']
+        if cfg_export['export']:
+            if self.aborted(file):
+                return
+            QtCore.QCoreApplication.instance().processEvents()
+            try:
+                ExportController().export(self.export_config)
+            except Exception as e:
+                # Don't let an export problem lose the evaluation work
+                # already done above - still fall through to save it.
+                self.batch_evaluation_messages.append(
+                    f"{file['path']}: export failed - {e}")
+                logger.warning(
+                    'Batch export failed for %s', file['path'],
+                    exc_info=True)
 
         # Save the evaluated data
         self.save_session()

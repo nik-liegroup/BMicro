@@ -7,10 +7,8 @@ from mpl_toolkits.mplot3d.axes3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import warnings
 
-import time
-
 from PyQt6 import QtWidgets, uic, QtCore
-from PyQt6.QtCore import QObject, QTimer, QThread, pyqtSignal, QCoreApplication
+from PyQt6.QtCore import QObject, QTimer, QThread, pyqtSignal
 import multiprocessing as mp
 
 from bmlab.session import Session
@@ -731,9 +729,21 @@ class EvaluationView(QtWidgets.QWidget):
         self.thread.start()
 
         if blocking:
-            while self.evaluation_running:
-                QCoreApplication.instance().processEvents()
-                time.sleep(0.1)
+            # A real Qt event loop, not a manual processEvents()+sleep()
+            # poll: the latter starves the window's own message pump
+            # during every sleep() call (a plain Python sleep blocks
+            # the whole OS thread, Qt included), which on Windows can
+            # make an unfocused/idle window's queued cross-thread
+            # signals (like this worker's own `finished`) sit
+            # undelivered for a long time - long batch runs would
+            # visibly stall until the window was interacted with (e.g.
+            # moved) and its message queue got serviced again.
+            # QEventLoop.exec() instead blocks efficiently on the OS's
+            # own message wait and wakes up the instant `finished` is
+            # queued.
+            loop = QtCore.QEventLoop()
+            self.worker.finished.connect(loop.quit)
+            loop.exec()
 
     def refresh_ui(self):
         # If evaluation is aborted by user,
