@@ -63,6 +63,11 @@
         <string>Evaluation</string>
        </attribute>
       </widget>
+      <widget class="QWidget" name="tab_quality">
+       <attribute name="title">
+        <string>Quality</string>
+       </attribute>
+      </widget>
      </widget>
     </item>
    </layout>

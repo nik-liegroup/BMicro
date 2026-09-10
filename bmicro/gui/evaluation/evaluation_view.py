@@ -74,7 +74,15 @@ class EvaluationView(QtWidgets.QWidget):
             self.on_select_parameter)
 
         self.aspect_ratio.clicked.connect(
-            self.refresh_plot)
+            self.on_aspect_ratio_changed)
+
+        # Set via set_quality_view() once both tabs exist (see
+        # MainWindow.__init__) - lets the Quality tab's own 2D view
+        # (which reuses this rendering style, see QualityView) follow
+        # this tab's z-slice/autoscale/ignore-outliers/aspect-ratio
+        # choices, and vice versa, since both show the same
+        # measurement grid.
+        self._quality_view = None
 
         # 3D data can be viewed either as a single 2D z-slice (paged
         # through with a slider) or as actual 3D cubes at the real
@@ -528,6 +536,11 @@ class EvaluationView(QtWidgets.QWidget):
         self.plot = self.mplcanvas.get_figure().add_subplot(111)
         self.image_map = None
         self.colorbar = None
+        # The clf() above already invalidated any Quality tab fail
+        # markers drawn on the old axes (see refresh_plot()) - drop
+        # its now-stale references to them too.
+        if self._quality_view is not None:
+            self._quality_view._fail_markers = []
         self.updateBoundsTable()
         self.nrBrillouinPeaks_1.setChecked(True)
         # Blocked for the same reason as combobox_peak_number just
@@ -583,6 +596,85 @@ class EvaluationView(QtWidgets.QWidget):
         self.value_max.setDisabled(autoscale)
         self.ignore_outliers.setDisabled(not autoscale)
         self.refresh_plot()
+        if self._quality_view is not None:
+            self._quality_view.sync_view_prefs(
+                autoscale=autoscale,
+                ignore_outliers=self.ignore_outliers.isChecked())
+
+    def on_aspect_ratio_changed(self):
+        self.refresh_plot()
+        if self._quality_view is not None:
+            self._quality_view.sync_view_prefs(
+                aspect_ratio=self.aspect_ratio.isChecked())
+
+    def set_quality_view(self, quality_view):
+        """
+        Cross-links this tab with the Quality tab's own 2D view (see
+        QualityView.set_evaluation_view(), called the same way from
+        MainWindow right after both tabs are built) so a z-slice or
+        autoscale/ignore-outliers/aspect-ratio change in either one is
+        reflected in the other - they show the same measurement grid.
+        """
+        self._quality_view = quality_view
+
+    def on_tab_activated(self):
+        """
+        Called by MainWindow.update_ui() when this tab becomes the
+        current one. The plot canvas is shared with the Quality tab
+        (see QualityView.on_tab_activated()/mpl.MplCanvas.attach_to())
+        rather than each tab keeping its own, so re-attach it here if
+        it isn't already, preserving whatever pan/zoom was set on it
+        (both tabs plot the same measurement grid, just different
+        data, so the limits stay meaningful across the switch).
+        """
+        if self.mplcanvas.parentWidget() is self.image_widget:
+            self.update_ui()
+            return
+        try:
+            xlim, ylim = self.plot.get_xlim(), self.plot.get_ylim()
+        except Exception:
+            xlim = ylim = None
+        self.mplcanvas.attach_to(self.image_widget)
+        self.update_ui()
+        if xlim is not None:
+            try:
+                self.plot.set_xlim(xlim)
+                self.plot.set_ylim(ylim)
+                self.mplcanvas.draw()
+            except Exception:
+                pass
+
+    def sync_z_slice(self, value):
+        """Called by the Quality tab when ITS z-slice changes."""
+        if value == self.z_slice_index:
+            return
+        self.z_slice_index = value
+        self.z_slider.blockSignals(True)
+        self.z_slider.setValue(value)
+        self.z_slider.blockSignals(False)
+        self.refresh_plot()
+
+    def sync_view_prefs(self, autoscale=None, ignore_outliers=None,
+                        aspect_ratio=None):
+        """Called by the Quality tab when one of these checkboxes
+        changes there."""
+        changed = False
+        for checkbox, value in (
+                (self.autoscale, autoscale),
+                (self.ignore_outliers, ignore_outliers),
+                (self.aspect_ratio, aspect_ratio)):
+            if value is None or checkbox.isChecked() == value:
+                continue
+            checkbox.blockSignals(True)
+            checkbox.setChecked(value)
+            checkbox.blockSignals(False)
+            changed = True
+        if autoscale is not None:
+            self.value_min.setDisabled(autoscale)
+            self.value_max.setDisabled(autoscale)
+            self.ignore_outliers.setDisabled(not autoscale)
+        if changed:
+            self.refresh_plot()
 
     def evaluate(self, blocking=False):
         # Check that a file is open
@@ -627,6 +719,14 @@ class EvaluationView(QtWidgets.QWidget):
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.worker.finished.connect(self.refresh_ui)
+        if self._quality_view is not None:
+            # Whatever triggered this evaluate() - the button here, or
+            # the Quality tab auto-recomputing a session whose fit
+            # predates brillouin_peak_snr/_nrmse/_center_uncertainty
+            # (see QualityView.update_ui()) - that tab's own view is
+            # stale until this finishes.
+            self.worker.finished.connect(
+                self._quality_view.on_evaluation_finished)
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
 
@@ -665,6 +765,17 @@ class EvaluationView(QtWidgets.QWidget):
         evm = session.evaluation_model()
         if evm is None:
             return
+        # The shared canvas (see set_quality_view()/on_tab_activated())
+        # currently belongs to the Quality tab - nothing to draw here
+        # until this tab is activated again.
+        if self.mplcanvas.parentWidget() is not self.image_widget:
+            return
+        # The Quality tab's failing-point cross markers (see
+        # QualityView.refresh_plot()) live on this same shared axes -
+        # drop them before drawing our own selected parameter here, or
+        # they'd show up on top of it.
+        if self._quality_view is not None:
+            self._quality_view.clear_fail_markers()
 
         parameters = evm.get_parameter_keys()
 
@@ -896,6 +1007,8 @@ class EvaluationView(QtWidgets.QWidget):
     def on_z_slider_changed(self, value):
         self.z_slice_index = value
         self.refresh_plot()
+        if self._quality_view is not None:
+            self._quality_view.sync_z_slice(value)
 
     def on_toggle_3d_view(self):
         self.show_3d = not self.show_3d
@@ -903,8 +1016,8 @@ class EvaluationView(QtWidgets.QWidget):
             'Switch to 2D view' if self.show_3d else 'Switch to 3D view')
         self.refresh_plot()
 
-    def _draw_3d_cubes(self, x, y, z, data, labels, parameter_key,
-                        parameters):
+    def _draw_3d_cubes(
+            self, x, y, z, data, labels, parameter_key, parameters):
         """
         Renders one cuboid per measurement point, centered on its
         actual (x, y, z) position (not a nominal/regular grid position -
@@ -968,9 +1081,12 @@ class EvaluationView(QtWidgets.QWidget):
         self.plot.add_collection3d(poly)
         self.image_map = poly
 
-        x_min, x_max = np.nanmin(x) - half_extent[0], np.nanmax(x) + half_extent[0]
-        y_min, y_max = np.nanmin(y) - half_extent[1], np.nanmax(y) + half_extent[1]
-        z_min, z_max = np.nanmin(z) - half_extent[2], np.nanmax(z) + half_extent[2]
+        x_min = np.nanmin(x) - half_extent[0]
+        x_max = np.nanmax(x) + half_extent[0]
+        y_min = np.nanmin(y) - half_extent[1]
+        y_max = np.nanmax(y) + half_extent[1]
+        z_min = np.nanmin(z) - half_extent[2]
+        z_max = np.nanmax(z) + half_extent[2]
         self.plot.set_xlim(x_min, x_max)
         self.plot.set_ylim(y_min, y_max)
         self.plot.set_zlim(z_min, z_max)

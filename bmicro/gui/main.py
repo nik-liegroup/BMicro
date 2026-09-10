@@ -11,7 +11,7 @@ import numpy as np
 
 from PyQt6 import QtWidgets, uic, QtCore, QtGui
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, \
-    QVBoxLayout, QWidget, QCheckBox, QHBoxLayout, QLabel, QLineEdit
+    QVBoxLayout, QCheckBox, QLabel
 from PyQt6.QtCore import QSize
 
 from bmlab.session import Session, get_session_file_path
@@ -26,6 +26,7 @@ from . import extraction
 from . import calibration
 from . import peak_selection
 from . import evaluation
+from . import quality
 
 from bmicro import __version__ as bmicroversion
 from bmlab import __version__ as bmlabversion
@@ -171,6 +172,13 @@ class BMicro(QtWidgets.QMainWindow):
                 'nr_brillouin_peaks': 1,
                 'bounds_w0': None,
                 'bounds_fwhm': None,
+                # If set, each file's quality_thresholds are reset to
+                # EvaluationModel.get_default_quality_thresholds()
+                # after evaluating - lets a batch run bring older
+                # files (saved before that method existed, or with no
+                # thresholds at all) up to the current defaults,
+                # rather than leaving them untouched.
+                'reset_quality_thresholds': False,
             },
             'export': {
                 'export': False,
@@ -200,6 +208,16 @@ class BMicro(QtWidgets.QMainWindow):
         self.layout_evaluation = QtWidgets.QVBoxLayout()
         self.tab_evaluation.setLayout(self.layout_evaluation)
         self.layout_evaluation.addWidget(self.widget_evaluation_view)
+        self.widget_quality_view = quality.QualityView(self)
+        self.layout_quality = QtWidgets.QVBoxLayout()
+        self.tab_quality.setLayout(self.layout_quality)
+        self.layout_quality.addWidget(self.widget_quality_view)
+        # Cross-link so a z-slice/autoscale/ignore-outliers/aspect-ratio
+        # change in either tab's 2D view is reflected in the other -
+        # both show the same measurement grid.
+        self.widget_evaluation_view.set_quality_view(self.widget_quality_view)
+        self.widget_quality_view.set_evaluation_view(
+            self.widget_evaluation_view)
 
         self.connect_menu()
 
@@ -272,17 +290,39 @@ class BMicro(QtWidgets.QMainWindow):
         self.reset_ui()
 
     def on_action_export_file(self):
+        session = Session.get_instance()
+        repetition_keys = \
+            session.file.repetition_keys() if session.file else []
         self.export_dialog = self._build_export_config_dialog(
-            'Export configuration', self.export_file)
+            'Export configuration', self.export_file, repetition_keys)
         self.export_dialog.open()
 
-    def _build_export_config_dialog(self, title, on_export):
+    def _build_export_config_dialog(
+            self, title, on_export, repetition_keys=None):
         """
-        Builds the "what to export" dialog (the checkboxes for
-        overview brightfield / surface / per-parameter Brillouin maps
-        etc.), shared between the single-file export and batch export
-        entry points. `on_export` is called (with no arguments) when
-        the dialog's Export button is clicked.
+        Builds the "what to export" dialog (checkboxes for overview
+        brightfield / surface / which repetitions), shared between the
+        single-file export and batch export entry points. `on_export`
+        is called (with no arguments) when the dialog's Export button
+        is clicked.
+
+        There is no per-parameter choice here (and none in the "Batch
+        evaluation" wizard's own export step either - see
+        on_action_batch_evaluation()): BrillouinExport now always
+        writes every evaluated quantity into one combined CSV per
+        repetition, so `self.export_config['brillouin']['parameters']`
+        is fixed to "every parameter" for this dialog rather than left
+        for the user to narrow down.
+
+        `repetition_keys`, for the single-file export entry point, is
+        the currently open file's own Brillouin repetition keys (e.g.
+        ['0', '1']) - one checkbox is shown per key, all checked by
+        default, so a user can restrict the export to a subset of
+        repetitions. Left as None for batch export: the dialog there
+        is built once for potentially many files with different (or
+        as-yet-unknown) repetitions, so no per-repetition choice is
+        offered and every repetition is exported for every file, as
+        before.
         """
         dialog = QtWidgets.QDialog(
             self,
@@ -297,7 +337,10 @@ class BMicro(QtWidgets.QMainWindow):
             QtCore.Qt.WindowModality.ApplicationModal)
         dialog.button_export.clicked.connect(lambda: on_export())
         dialog.button_cancel.clicked.connect(dialog.close)
-        self.init_export_dialog(dialog.widget)
+        self.export_config['brillouin']['parameters'] = list(
+            EvaluationModel.get_default_parameters())
+        self.init_export_repetitions(dialog.groupBox_repetitions,
+                                     repetition_keys)
 
         checkbox_overview = dialog.checkbox_export_overview_brightfield
         checkbox_overview.setChecked(
@@ -311,118 +354,60 @@ class BMicro(QtWidgets.QMainWindow):
         checkbox_surface.toggled.connect(
             self.on_export_surface_checkbox)
 
-        dialog.resize(QSize(500, 560))
+        dialog.resize(QSize(500, 260))
         return dialog
+
+    def init_export_repetitions(self, group_box, repetition_keys):
+        """
+        Populates `group_box` with one "all checked" checkbox per key
+        in `repetition_keys`, wired to `on_export_repetition_checkbox`,
+        or hides it entirely when `repetition_keys` is None (batch
+        export - see `_build_export_config_dialog`). Rebuilt from
+        scratch on every dialog open, so `export_config['brillouin']
+        ['repetitions']` always starts as "every repetition selected"
+        for whichever file/keys are current, rather than carrying over
+        a stale selection from a previously opened file.
+        """
+        layout = group_box.layout()
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not repetition_keys:
+            self.export_config['brillouin']['repetitions'] = \
+                None if repetition_keys is None else []
+            group_box.setVisible(False)
+            return
+
+        group_box.setVisible(True)
+        self.export_config['brillouin']['repetitions'] = list(
+            repetition_keys)
+        for rep_key in repetition_keys:
+            checkbox = QCheckBox()
+            checkbox.setText(f'Repetition {rep_key}')
+            checkbox.setChecked(True)
+            checkbox.toggled.connect(
+                lambda checked, rep=rep_key:
+                self.on_export_repetition_checkbox(rep, checked)
+            )
+            layout.addWidget(checkbox)
+
+    def on_export_repetition_checkbox(self, repetition, checked):
+        repetitions = self.export_config['brillouin']['repetitions']
+        if repetitions is None:
+            return
+        if checked:
+            if repetition not in repetitions:
+                repetitions.append(repetition)
+        elif repetition in repetitions:
+            repetitions.remove(repetition)
 
     def on_export_overview_brightfield_checkbox(self, checked):
         self.export_config['overviewBrightfield']['export'] = checked
 
     def on_export_surface_checkbox(self, checked):
         self.export_config['surface']['export'] = checked
-
-    def on_export_checkbox(self, parameter, min_box, max_box):
-        checked = self.sender().isChecked()
-        if checked:
-            self.export_config['brillouin']['parameters'].append(parameter)
-        else:
-            self.export_config['brillouin']['parameters'].remove(parameter)
-        min_box.setEnabled(checked)
-        max_box.setEnabled(checked)
-
-    def on_export_minbox(self, value, parameter):
-        cax = [value, 'max']
-        # We use the existing upper limit if available
-        if parameter in self.export_config['brillouin']:
-            cax[1] = self.export_config['brillouin'][parameter]['cax'][1]
-            self.export_config['brillouin'][parameter]['cax'] = tuple(cax)
-        else:
-            self.export_config['brillouin'][parameter] = {'cax': tuple(cax)}
-
-    def on_export_maxbox(self, value, parameter):
-        cax = ['min', value]
-        # We use the existing lower limit if available
-        if parameter in self.export_config['brillouin']:
-            cax[0] = self.export_config['brillouin'][parameter]['cax'][0]
-            self.export_config['brillouin'][parameter]['cax'] = tuple(cax)
-        else:
-            self.export_config['brillouin'][parameter] = {'cax': tuple(cax)}
-
-    def init_export_dialog(self, parent_widget):
-        v_layout = QVBoxLayout()
-        v_layout.setContentsMargins(0, 6, 0, 6)
-        v_layout.setSpacing(0)
-
-        parameters = EvaluationModel.get_default_parameters()
-        for key, parameter in parameters.items():
-            h_layout = QHBoxLayout()
-
-            # Checkbox
-            checkbox = QCheckBox()
-            checkbox.setText(
-                parameter['label'] + ' [' + parameter['unit'] + ']')
-            if key in self.export_config['brillouin']['parameters']:
-                checkbox.setChecked(True)
-            h_layout.addWidget(checkbox)
-            # Spacer
-            h_layout.addStretch()
-
-            # Min label and input box
-            min_label = QLabel()
-            min_label.setText('min')
-            h_layout.addWidget(min_label)
-            min_box = QLineEdit()
-            min_box.setMaximumSize(QSize(50, 20))
-            min_box.setMinimumSize(QSize(50, 20))
-            h_layout.addWidget(min_box)
-
-            # Max label and input box
-            max_label = QLabel()
-            max_label.setText('max')
-            h_layout.addWidget(max_label)
-            max_box = QLineEdit()
-            max_box.setMaximumSize(QSize(50, 20))
-            max_box.setMinimumSize(QSize(50, 20))
-            h_layout.addWidget(max_box)
-
-            # Widget to add the elements to
-            parameter_widget = QWidget()
-            parameter_widget.setMaximumSize(QSize(5000, 35))
-            parameter_widget.setLayout(h_layout)
-            v_layout.addWidget(parameter_widget)
-
-            # Set the current config values
-            if key in self.export_config['brillouin']:
-                min_box.setText(self.export_config['brillouin'][key]['cax'][0])
-                max_box.setText(self.export_config['brillouin'][key]['cax'][1])
-            # Otherwise we set it to the default min/max
-            else:
-                min_box.setText('min')
-                max_box.setText('max')
-
-            if key in self.export_config['brillouin']['parameters']:
-                checkbox.setChecked(True)
-                min_box.setEnabled(True)
-                max_box.setEnabled(True)
-            else:
-                min_box.setEnabled(False)
-                max_box.setEnabled(False)
-
-            # Connect handlers
-            checkbox.clicked.connect(
-                lambda checked, param=key, minbox=min_box, maxbox=max_box:
-                self.on_export_checkbox(param, minbox, maxbox)
-            )
-            min_box.textChanged.connect(
-                lambda value, param=key: self.on_export_minbox(value, param)
-            )
-            max_box.textChanged.connect(
-                lambda value, param=key: self.on_export_maxbox(value, param)
-            )
-
-        # This only works if there is no layout set yet!
-        parent_widget.setLayout(v_layout)
-        # self.export_dialog.scrollAreaWidgetContents.\
-        #     setMinimumSize(QSize(0, 40*len(parameters)))
 
     def close_export_dialog(self):
         self.export_dialog.close()
@@ -580,6 +565,7 @@ class BMicro(QtWidgets.QMainWindow):
         self.widget_calibration_view.reset_ui()
         self.widget_peak_selection_view.reset_ui()
         self.widget_evaluation_view.reset_ui()
+        self.widget_quality_view.reset_ui()
 
     def update_ui(self, new_tab_index=-1):
         # If no tab index is specified, we update all tabs
@@ -591,6 +577,7 @@ class BMicro(QtWidgets.QMainWindow):
             self.widget_calibration_view.update_ui()
             self.widget_peak_selection_view.update_ui()
             self.widget_evaluation_view.update_ui()
+            self.widget_quality_view.update_ui()
         elif new_tab_index == 0:
             self.widget_data_view.update_ui()
         elif new_tab_index == 1:
@@ -600,7 +587,9 @@ class BMicro(QtWidgets.QMainWindow):
         elif new_tab_index == 3:
             self.widget_peak_selection_view.update_ui()
         elif new_tab_index == 4:
-            self.widget_evaluation_view.update_ui()
+            self.widget_evaluation_view.on_tab_activated()
+        elif new_tab_index == 5:
+            self.widget_quality_view.on_tab_activated()
 
     @staticmethod
     def drag_enter_event(event):
@@ -664,7 +653,18 @@ class BMicro(QtWidgets.QMainWindow):
             self.batch_remove_files
         )
         self.update_batch_file_table()
-        self.init_export_dialog(self.batch_dialog.widget_parameters)
+        # Batch evaluation's export step reuses the same export_config
+        # as the regular Export/Batch export dialogs (see
+        # _build_export_config_dialog()) and behaves the same way now:
+        # every parameter and every repetition, no per-file choice -
+        # there used to be a per-parameter checkbox list here, but it
+        # only affected the (long-superseded) per-parameter image-plot
+        # export, never the combined CSV, and nothing else in the app
+        # still exposes that choice either.
+        self.export_config['brillouin']['parameters'] = list(
+            EvaluationModel.get_default_parameters())
+        self.export_config['brillouin']['repetitions'] = None
+        self.batch_dialog.widget_parameters.setVisible(False)
         self.batch_dialog.adjustSize()
 
         self.update_batch_file_settings()
@@ -832,6 +832,12 @@ class BMicro(QtWidgets.QMainWindow):
             .setChecked(cfg_evaluation['evaluate'])
         self.batch_dialog.checkBox_evaluation\
             .clicked.connect(self.on_evaluation_evaluate)
+        self.batch_dialog.checkBox_quality_reset_defaults.setChecked(
+            cfg_evaluation['reset_quality_thresholds'])
+        self.batch_dialog.checkBox_quality_reset_defaults.clicked.connect(
+            self.on_quality_reset_defaults)
+        self.batch_dialog.checkBox_quality_reset_defaults\
+            .setEnabled(cfg_evaluation['evaluate'])
         self.batch_dialog.nrBrillouinPeaksGroup\
             .setEnabled(cfg_evaluation['evaluate'])
         if cfg_evaluation['nr_brillouin_peaks'] == 1:
@@ -1107,10 +1113,16 @@ class BMicro(QtWidgets.QMainWindow):
             = self.sender().isChecked()
         self.batch_dialog.nrBrillouinPeaksGroup\
             .setEnabled(self.batch_config['evaluation']['evaluate'])
+        self.batch_dialog.checkBox_quality_reset_defaults\
+            .setEnabled(self.batch_config['evaluation']['evaluate'])
         self.batch_dialog.bounds_table\
             .setEnabled(
                 self.batch_config['evaluation']['evaluate'] and
                 self.batch_config['evaluation']['nr_brillouin_peaks'] > 1)
+
+    def on_quality_reset_defaults(self):
+        self.batch_config['evaluation']['reset_quality_thresholds']\
+            = self.sender().isChecked()
 
     def on_export_export(self):
         self.batch_config['export']['export'] = self.sender().isChecked()
@@ -1241,12 +1253,49 @@ class BMicro(QtWidgets.QMainWindow):
                 if self.aborted(file):
                     return
                 QtCore.QCoreApplication.instance().processEvents()
+
+                # If "Select peaks"/"Calibrate" aren't ticked for this
+                # batch run, evaluation relies entirely on whatever was
+                # already saved for this file (see set_file()/load() -
+                # loaded before this loop, in open_file() above). A
+                # file with neither would otherwise fit silently
+                # against undefined regions/calibration - fail loudly
+                # instead (caught by run_batch_evaluation(), which
+                # marks this file 'failed' and moves on).
+                pm = session.peak_selection_model()
+                if not pm.get_brillouin_regions() \
+                        or not pm.get_rayleigh_regions():
+                    raise RuntimeError(
+                        f"Repetition {rep_key} of {file['path']} has "
+                        f"no Brillouin/Rayleigh peak regions selected, "
+                        f"and 'Select peaks' isn't ticked to define "
+                        f"them for this batch run - refusing to "
+                        f"evaluate against undefined regions.")
+                cm = session.calibration_model()
+                if cm.frequencies_by_time_interpolator is None:
+                    raise RuntimeError(
+                        f"Repetition {rep_key} of {file['path']} has "
+                        f"no valid calibration, and 'Calibrate' isn't "
+                        f"ticked to create one for this batch run - "
+                        f"refusing to evaluate without a frequency "
+                        f"calibration.")
+
                 evc = EvaluationController()
                 evc.set_nr_brillouin_peaks(
                     cfg_evaluation['nr_brillouin_peaks'])
                 evc.set_bounds(cfg_evaluation['bounds_w0'])
                 evc.set_bounds_fwhm(cfg_evaluation['bounds_fwhm'])
                 self.widget_evaluation_view.evaluate(blocking=True)
+                if cfg_evaluation['reset_quality_thresholds']:
+                    session.evaluation_model().quality_thresholds = \
+                        EvaluationModel.get_default_quality_thresholds()
+                # Writes evm.results['quality_pass'] from whatever
+                # quality_thresholds this file now has (just reset to
+                # the defaults above, or its own previously saved/
+                # default ones) - same as clicking "Apply to results"
+                # on the Quality tab, so it's exported/saved without
+                # requiring a manual step per file.
+                evc.apply_quality_thresholds()
 
             cfg_export = self.batch_config['export']
             if cfg_export['export']:

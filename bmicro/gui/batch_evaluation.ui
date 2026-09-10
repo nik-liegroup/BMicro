@@ -855,6 +855,16 @@
                     </layout>
                    </item>
                    <item>
+                    <widget class="QCheckBox" name="checkBox_quality_reset_defaults">
+                     <property name="text">
+                      <string>Reset quality thresholds to data-driven defaults</string>
+                     </property>
+                     <property name="checked">
+                      <bool>false</bool>
+                     </property>
+                    </widget>
+                   </item>
+                   <item>
                     <widget class="QGroupBox" name="nrBrillouinPeaksGroup">
                      <property name="maximumSize">
                       <size>
