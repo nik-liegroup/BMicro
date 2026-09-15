@@ -173,7 +173,8 @@ class DataView(QtWidgets.QWidget):
             QtCore.QCoreApplication.instance().processEvents()
             evc = EvaluationController()
             evc.set_nr_brillouin_peaks(1)
-            self.parent.widget_evaluation_view.evaluate(blocking=True)
+            self.parent.widget_evaluation_view.evaluate(
+                blocking=True, notify_blocked=False)
 
     def on_rotation_clicked(self):
         """

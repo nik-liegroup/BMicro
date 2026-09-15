@@ -1,6 +1,8 @@
 import pathlib
 import shutil
 
+from PyQt6.QtWidgets import QCheckBox
+
 from bmlab.session import Session
 
 from bmicro.gui.main import BMicro
@@ -43,6 +45,54 @@ def test_export_dialog_has_additional_data_checkboxes(qtbot, mocker):
     assert window.export_config['surface']['export'] is False
 
     window.close_export_dialog()
+    window.close()
+
+
+def test_export_dialog_repetition_checkboxes(qtbot, mocker):
+    window = BMicro()
+    qtbot.add_widget(window)
+    file_name = 'SurfaceScan.h5'
+    file_path = data_file_path(file_name)
+
+    def mock_getOpenFileName(self, *args, **kwargs):
+        return file_path, None
+
+    mocker.patch('PyQt6.QtWidgets.QFileDialog.getOpenFileName',
+                 mock_getOpenFileName)
+    window.open_file()
+
+    window.on_action_export_file()
+
+    # SurfaceScan.h5 has two Brillouin repetitions ('0', '1') - one
+    # checkbox per repetition, all checked by default (export
+    # everything, matching the pre-existing default behaviour).
+    group_box = window.export_dialog.groupBox_repetitions
+    assert group_box.isVisible()
+    checkboxes = group_box.findChildren(QCheckBox)
+    assert len(checkboxes) == 2
+    assert all(box.isChecked() for box in checkboxes)
+    assert window.export_config['brillouin']['repetitions'] == ['0', '1']
+
+    checkboxes[1].setChecked(False)
+    assert window.export_config['brillouin']['repetitions'] == ['0']
+
+    window.close_export_dialog()
+    window.close()
+
+
+def test_export_dialog_batch_hides_repetition_checkboxes(qtbot, mocker):
+    window = BMicro()
+    qtbot.add_widget(window)
+
+    window.batch_export_dialog = window._build_export_config_dialog(
+        'Batch export configuration', lambda: None)
+    window.batch_export_dialog.open()
+
+    group_box = window.batch_export_dialog.groupBox_repetitions
+    assert not group_box.isVisible()
+    assert window.export_config['brillouin']['repetitions'] is None
+
+    window.batch_export_dialog.close()
     window.close()
 
 

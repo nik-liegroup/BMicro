@@ -43,6 +43,7 @@ def test_open_file_shows_metadata(qtbot, mocker):
                  mock_getOpenFileName)
 
     window.open_file()
+
     w = window.widget_data_view
     assert w.label_selected_file.text() == str(file_name)
     assert w.label_selected_file.toolTip() == str(file_path)
@@ -53,6 +54,31 @@ def test_open_file_shows_metadata(qtbot, mocker):
     assert w.label_calibration.text() == 'True'
     assert w.textedit_comment.toPlainText() == 'Brillouin data'
 
+    window.close()
+
+
+def test_start_batch_evaluation_refuses_while_export_running(qtbot, mocker):
+    """
+    start_batch_evaluation() must not start a batch run while an
+    export is already in progress - every file's evaluate() call would
+    silently decline to run (EvaluationView.evaluate()'s own
+    export_running guard), leaving the batch limping through files it
+    never actually evaluated.
+    """
+    window = BMicro()
+    qtbot.add_widget(window)
+
+    warn = mocker.patch.object(window, '_warn_export_in_progress')
+    run_batch = mocker.patch.object(window, 'run_batch_evaluation')
+
+    window.export_running = True
+    window.start_batch_evaluation()
+
+    warn.assert_called_once()
+    run_batch.assert_not_called()
+    assert window.batch_evaluation_running is False
+
+    window.export_running = False
     window.close()
 
 

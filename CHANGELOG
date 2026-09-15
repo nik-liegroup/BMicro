@@ -1,3 +1,19 @@
+## 0.13.0 - 2026-09-10
+
+### Added
+- feat: Quality tab for live threshold tuning against fit-quality
+  metrics (bmlab 0.13.0), sharing its 2D view/canvas with the
+  Evaluation tab (pan/zoom, click-to-spectrum) and with a histogram
+  popup window
+- feat: batch evaluation's export step now matches the regular export
+  (every parameter, every repetition), and can reset quality
+  thresholds to their data-driven defaults
+
+### Fixed
+- fix: batch evaluation now raises instead of silently fitting when a
+  file has no calibration/peak selection and neither is ticked to
+  create one
+
 ## 0.12.4 - 2026-06-23
 
 ### Fixed
