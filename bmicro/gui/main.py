@@ -27,6 +27,7 @@ from . import calibration
 from . import peak_selection
 from . import evaluation
 from . import quality
+from . import background
 
 from bmicro import __version__ as bmicroversion
 from bmlab import __version__ as bmlabversion
@@ -225,6 +226,10 @@ class BMicro(QtWidgets.QMainWindow):
         self.widget_evaluation_view.set_quality_view(self.widget_quality_view)
         self.widget_quality_view.set_evaluation_view(
             self.widget_evaluation_view)
+        self.widget_background_view = background.BackgroundView(self)
+        self.layout_background = QtWidgets.QVBoxLayout()
+        self.tab_background.setLayout(self.layout_background)
+        self.layout_background.addWidget(self.widget_background_view)
 
         self.connect_menu()
 
@@ -616,6 +621,7 @@ class BMicro(QtWidgets.QMainWindow):
         self.widget_peak_selection_view.reset_ui()
         self.widget_evaluation_view.reset_ui()
         self.widget_quality_view.reset_ui()
+        self.widget_background_view.reset_ui()
 
     def update_ui(self, new_tab_index=-1):
         # If no tab index is specified, we update all tabs
@@ -628,6 +634,7 @@ class BMicro(QtWidgets.QMainWindow):
             self.widget_peak_selection_view.update_ui()
             self.widget_evaluation_view.update_ui()
             self.widget_quality_view.update_ui()
+            self.widget_background_view.update_ui()
         elif new_tab_index == 0:
             self.widget_data_view.update_ui()
         elif new_tab_index == 1:
@@ -640,6 +647,8 @@ class BMicro(QtWidgets.QMainWindow):
             self.widget_evaluation_view.on_tab_activated()
         elif new_tab_index == 5:
             self.widget_quality_view.on_tab_activated()
+        elif new_tab_index == 6:
+            self.widget_background_view.update_ui()
 
     @staticmethod
     def drag_enter_event(event):

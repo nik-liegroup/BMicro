@@ -1,6 +1,8 @@
 import pathlib
 import shutil
 
+import h5py
+import numpy as np
 from PyQt6.QtWidgets import QCheckBox
 
 from bmlab.session import Session
@@ -101,6 +103,16 @@ def test_export_surface_and_overview_brightfield(qtbot, mocker, tmp_path):
     file_path = tmp_path / file_name
     shutil.copy(data_file_path(file_name), file_path)
 
+    # SurfaceScan.h5 predates brillouin_repetition_index (see bmlab's
+    # MeasurementData.get_brillouin_repetition_index()) - add it to its
+    # overview images directly (mimicking what a real BrillouinAcquisition
+    # capture now writes) so the export exercises the real, current
+    # '_BMrepN' naming instead of falling back to a timestamp tag.
+    with h5py.File(file_path, 'r+') as f:
+        for idx in range(4):
+            ds = f[f'Fluorescence/0/payload/data/{idx}']
+            ds.attrs['brillouin_repetition_index'] = np.array([0])
+
     window = BMicro()
     qtbot.add_widget(window)
 
@@ -133,10 +145,10 @@ def test_export_surface_and_overview_brightfield(qtbot, mocker, tmp_path):
     # 2 z-planes x 2 tiles each - one tiled-mosaic file per z-plane.
     assert (
         tmp_path
-        / 'overviewZStack_0_BMrep0_afterAcq_tiled.tif').exists()
+        / 'overviewZStack_0_BMrep0_tiled.tif').exists()
     assert (
         tmp_path
-        / 'overviewZStack_1_BMrep0_afterAcq_tiled.tif').exists()
+        / 'overviewZStack_1_BMrep0_tiled.tif').exists()
     assert (
         tmp_path / 'surface_BMrep0_metrics.json').exists()
 

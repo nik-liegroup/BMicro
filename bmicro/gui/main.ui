@@ -68,6 +68,11 @@
         <string>Quality</string>
        </attribute>
       </widget>
+      <widget class="QWidget" name="tab_background">
+       <attribute name="title">
+        <string>Background</string>
+       </attribute>
+      </widget>
      </widget>
     </item>
    </layout>
