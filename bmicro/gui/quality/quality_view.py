@@ -575,9 +575,11 @@ class QualityView(QtWidgets.QWidget):
 
         if dimensionality == 3:
             # Always a 2D slice through a slider here - no 3D-cube
-            # option (unlike the Evaluation tab).
-            b = data.shape[::-1]
-            z_axis = len(b) - np.argmin(b) - 1
+            # option (unlike the Evaluation tab). data/positions are
+            # always in a fixed x-y-z axis order (see Session.
+            # get_payload_positions()), so the slice axis is always z
+            # (axis 2), not whichever dimension happens to be smallest.
+            z_axis = 2
             z_len = data.shape[z_axis]
             self.z_slice_index = min(self.z_slice_index, z_len - 1)
             self.z_slider.blockSignals(True)

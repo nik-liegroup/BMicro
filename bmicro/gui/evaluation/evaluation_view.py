@@ -88,6 +88,13 @@ class EvaluationView(QtWidgets.QWidget):
         # hidden for non-3D data.
         self.show_3d = False
         self.z_slice_index = 0
+        # Whether the user has manually moved the z-slider for the
+        # currently selected repetition - see refresh_plot()'s own
+        # comment for why this matters (a ROI-restricted grid can have
+        # entire z-slices with no measured points at all, and index 0
+        # is just as likely to be one of those empty ones as any other).
+        self._z_slice_index_explicit = False
+        self._z_slice_repetition_key = None
         self.button_toggle_3d.setVisible(False)
         self.button_toggle_3d.clicked.connect(self.on_toggle_3d_view)
         self.z_slider.setVisible(False)
@@ -146,6 +153,17 @@ class EvaluationView(QtWidgets.QWidget):
         evm = session.evaluation_model()
         if evm is None:
             return
+
+        # A manually-picked z-slice only stays meaningful for the
+        # repetition it was picked on - a different repetition can have
+        # an entirely different ROI/coverage, so let refresh_plot() pick
+        # a sensible default again rather than carrying over a slice
+        # index that may now point at empty data (or, just as
+        # confusingly, at populated data purely by coincidence).
+        current_repetition = session.current_repetition_key()
+        if current_repetition != self._z_slice_repetition_key:
+            self._z_slice_repetition_key = current_repetition
+            self._z_slice_index_explicit = False
 
         if evm.nr_brillouin_peaks == 1:
             self.nrBrillouinPeaks_1.setChecked(True)
@@ -508,6 +526,9 @@ class EvaluationView(QtWidgets.QWidget):
     def reset_ui(self):
         self.evaluation_progress.setValue(0)
         self.show_3d = False
+        self.z_slice_index = 0
+        self._z_slice_index_explicit = False
+        self._z_slice_repetition_key = None
         self.button_toggle_3d.setText('Switch to 3D view')
         self.button_toggle_3d.setVisible(False)
         self.z_slider.setVisible(False)
@@ -647,6 +668,7 @@ class EvaluationView(QtWidgets.QWidget):
         if value == self.z_slice_index:
             return
         self.z_slice_index = value
+        self._z_slice_index_explicit = True
         self.z_slider.blockSignals(True)
         self.z_slider.setValue(value)
         self.z_slider.blockSignals(False)
@@ -795,6 +817,26 @@ class EvaluationView(QtWidgets.QWidget):
             self.plot_count = self.count.value
             self.refresh_plot()
 
+    @staticmethod
+    def _first_populated_z_slice(data, axis, preferred):
+        """
+        Returns the first index along `axis` (checking `preferred`
+        first, then the rest in order) whose slice of `data` has at
+        least one finite (measured) value - see refresh_plot()'s own
+        comment on why index 0 isn't a safe default to fall back to.
+        Falls back to `preferred` unchanged if no slice anywhere along
+        this axis has any data at all (e.g. before the first
+        evaluation - the resulting slice is empty either way).
+        """
+        length = data.shape[axis]
+        order = [preferred] + [i for i in range(length) if i != preferred]
+        for i in order:
+            index = [slice(None)] * data.ndim
+            index[axis] = i
+            if np.any(np.isfinite(data[tuple(index)])):
+                return i
+        return preferred
+
     def refresh_plot(self):
         session = Session.get_instance()
         evm = session.evaluation_model()
@@ -883,10 +925,28 @@ class EvaluationView(QtWidgets.QWidget):
         # via the slider, rendered exactly like a regular 2D dataset
         # (see dimensionality == 2, further down).
         if dimensionality == 3 and not self.show_3d:
-            # Slice along the last occurrence of the shortest dimension
-            b = data.shape[::-1]
-            z_axis = len(b) - np.argmin(b) - 1
+            # data/positions are always returned in a fixed x-y-z axis
+            # order (see Session.get_payload_positions()), regardless of
+            # which axis has the fewest grid points - so the axis to
+            # slice along for the 2D view is always z (axis 2), not
+            # whichever dimension happens to be smallest.
+            z_axis = 2
             z_len = data.shape[z_axis]
+
+            if not self._z_slice_index_explicit:
+                # Default to a slice that actually has measured data,
+                # rather than always index 0 - on a ROI-restricted grid,
+                # whichever axis this ends up slicing along can easily
+                # have its own first (or last) few indices entirely
+                # outside the drawn ROI, in which case index 0 would
+                # silently show a genuinely empty plot even though the
+                # rest of the grid has real data. Only applies until the
+                # user actually moves the slider themselves (see
+                # on_z_slider_changed()/sync_z_slice()) or switches
+                # repetition (see update_ui()).
+                self.z_slice_index = self._first_populated_z_slice(
+                    data, z_axis, min(self.z_slice_index, z_len - 1))
+
             self.z_slice_index = min(self.z_slice_index, z_len - 1)
             self.z_slider.blockSignals(True)
             self.z_slider.setMinimum(0)
@@ -1041,6 +1101,7 @@ class EvaluationView(QtWidgets.QWidget):
 
     def on_z_slider_changed(self, value):
         self.z_slice_index = value
+        self._z_slice_index_explicit = True
         self.refresh_plot()
         if self._quality_view is not None:
             self._quality_view.sync_z_slice(value)

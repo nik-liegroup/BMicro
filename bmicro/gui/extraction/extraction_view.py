@@ -34,6 +34,12 @@ class ExtractionView(QtWidgets.QWidget):
 
         self.mode = MODE_DEFAULT
         self.current_frame = 0
+        # Reentrancy guard for on_zoom_changed(): applying a crop calls
+        # refresh_image_plot(), which redraws the (now cropped) image and
+        # fires xlim_changed/ylim_changed again - without this, that
+        # would recurse into on_zoom_changed() a second time before the
+        # first call has returned.
+        self._syncing_crop = False
 
         self.mplcanvas = MplCanvas(
             self.image_widget, toolbar=('Home', 'Pan', 'Zoom'))
@@ -141,6 +147,10 @@ class ExtractionView(QtWidgets.QWidget):
         the camera ROI used at acquisition time was wider than a single
         VIPA order, without needing to re-acquire the data.
 
+        While checked, the crop keeps tracking further zooming too (see
+        on_zoom_changed()) - this only needs to capture the zoom as it
+        is right now, at the moment of checking.
+
         Unchecking removes the crop and restores the full image.
         """
         session = Session.get_instance()
@@ -179,13 +189,14 @@ class ExtractionView(QtWidgets.QWidget):
         self.image_plot.cla()
         # cla() drops any callbacks registered on the axes, so reconnect
         # these every refresh rather than once in __init__: fires on
-        # every zoom/pan (toolbar or programmatic) so the label stays
-        # live while the user is dragging the Zoom tool, not just when
-        # they let go of the mouse.
+        # every zoom/pan (toolbar or programmatic) so the label - and,
+        # while checkbox_use_zoom_as_crop is checked, the crop itself -
+        # stay live while the user is dragging the Zoom tool, not just
+        # when they let go of the mouse.
         self.image_plot.callbacks.connect(
-            'xlim_changed', self.update_zoom_label)
+            'xlim_changed', self.on_zoom_changed)
         self.image_plot.callbacks.connect(
-            'ylim_changed', self.update_zoom_label)
+            'ylim_changed', self.on_zoom_changed)
         session = Session.get_instance()
         calib_key = self.combobox_datasets.currentText()
         if not calib_key:
@@ -196,30 +207,121 @@ class ExtractionView(QtWidgets.QWidget):
         em = session.extraction_model()
         img = session.get_calibration_image(calib_key, self.current_frame)
 
-        # imshow should always get the transposed image such that
-        # the horizontal axis of the plot coincides with the
-        # 0-axis of the plotted array:
-        self.image_plot.imshow(img.T, origin='lower', vmin=100, vmax=300)
-        self.image_plot.set_title('Frame %d' % (self.current_frame+1))
+        # imshow()'s own initial autoscale - and the explicit
+        # on_zoom_changed() call below - must not be mistaken for a
+        # real user zoom: Crop.apply() clamps a too-large crop down to
+        # whatever a smaller image actually has (e.g. a repetition
+        # captured at a smaller camera ROI than the one the crop was
+        # drawn on), so the freshly drawn image's own axis extent can
+        # legitimately differ from session.crop's stored bounds even
+        # though nothing was zoomed. Without this guard, on_zoom_
+        # changed() reads that as "the view changed" and silently
+        # overwrites (shrinks) the crop for every repetition, not just
+        # the one being displayed - reproducible just by opening a
+        # file with checkbox_use_zoom_as_crop already checked from a
+        # saved session, no interactive zooming needed at all.
+        self._syncing_crop = True
+        try:
+            # imshow should always get the transposed image such that
+            # the horizontal axis of the plot coincides with the
+            # 0-axis of the plotted array:
+            self.image_plot.imshow(img.T, origin='lower', vmin=100, vmax=300)
+            self.image_plot.set_title('Frame %d' % (self.current_frame+1))
 
-        points = em.get_points(calib_key)
+            points = em.get_points(calib_key)
 
-        if len(points) >= 3:
-            em.set_image_shape(img.shape)
+            if len(points) >= 3:
+                em.set_image_shape(img.shape)
 
-            arcs = em.get_arc_by_calib_key(calib_key)
-            for arc in arcs:
-                dr = arc[-1] - arc[0]
-                line = matplotlib.patches.FancyArrow(
-                    *arc[0], dr[0], dr[1], head_width=0,
-                    head_length=0, color='Yellow', alpha=0.5)
-                self.image_plot.add_patch(line)
+                arcs = em.get_arc_by_calib_key(calib_key)
+                for arc in arcs:
+                    dr = arc[-1] - arc[0]
+                    line = matplotlib.patches.FancyArrow(
+                        *arc[0], dr[0], dr[1], head_width=0,
+                        head_length=0, color='Yellow', alpha=0.5)
+                    self.image_plot.add_patch(line)
 
-        self._plot_points(em.get_points(calib_key))
+            self._plot_points(em.get_points(calib_key))
 
-        self.mplcanvas.draw()
-        self.refresh_points()
+            self.mplcanvas.draw()
+            self.refresh_points()
+            self.on_zoom_changed()
+        finally:
+            self._syncing_crop = False
+
+    def on_zoom_changed(self, *_):
+        """
+        Called on every xlim_changed/ylim_changed - i.e. on every zoom or
+        pan, from the toolbar's Zoom/Pan tool, from a fresh
+        refresh_image_plot() draw, or programmatically - and, unlike the
+        checkbox's own toggled handler, regardless of when the checkbox
+        was checked relative to the zoom. Without this, checking
+        checkbox_use_zoom_as_crop and only then zooming left the crop
+        stuck at whatever (typically the full, un-zoomed) view was
+        showing at the moment of checking - a stale crop the user could
+        only fix by re-toggling the checkbox after zooming instead.
+
+        Takes an optional, unused argument so it can be used directly as
+        a matplotlib axes callback (xlim_changed/ylim_changed pass the
+        Axes as their sole argument).
+        """
         self.update_zoom_label()
+
+        if self._syncing_crop \
+                or not self.checkbox_use_zoom_as_crop.isChecked():
+            return
+
+        # A single zoom/pan gesture that changes both axes (box zoom,
+        # scroll zoom) fires xlim_changed and ylim_changed as two
+        # SEPARATE events, not atomically together - matplotlib calls
+        # set_xlim() and set_ylim() one after the other. Applying the
+        # crop right on the first of the two would compose it against
+        # the other axis' still-stale bounds (the previous view, not
+        # the new one), drifting the persisted crop away from what was
+        # actually shown - compounding further on every subsequent
+        # zoom. Defer to the next spin of the event loop, once both
+        # axes have settled, and coalesce any back-to-back events into
+        # a single update.
+        QtCore.QTimer.singleShot(0, self._apply_zoom_as_crop)
+
+    def _apply_zoom_as_crop(self):
+        if self._syncing_crop \
+                or not self.checkbox_use_zoom_as_crop.isChecked():
+            return
+
+        session = Session.get_instance()
+        x_min, x_max = self.image_plot.get_xlim()
+        y_min, y_max = self.image_plot.get_ylim()
+
+        # The displayed image is already the cropped one whenever a crop
+        # is active (Crop.apply() - see its own docstring), so these
+        # xlim/ylim are in that CROPPED image's own local pixel
+        # coordinates, not the original image's. Crop.bounds always
+        # means "relative to the original, uncropped image" - offsetting
+        # by the existing crop's own x_min/y_min converts back to that,
+        # rather than composing crops relative to each other, which
+        # would drift off the true position after repeated zooming.
+        existing = session.get_crop_bounds()
+        offset_x, offset_y = (existing[0], existing[2]) if existing \
+            else (0, 0)
+        new_bounds = (
+            x_min + offset_x, x_max + offset_x,
+            y_min + offset_y, y_max + offset_y,
+        )
+        if existing is not None and tuple(round(v) for v in new_bounds) \
+                == tuple(round(v) for v in existing):
+            # Already in sync (e.g. this call is refresh_image_plot()'s
+            # own redraw right after applying this same crop) - nothing
+            # to do, and re-applying would otherwise recurse forever via
+            # refresh_image_plot() -> cla() -> a fresh xlim_changed.
+            return
+
+        self._syncing_crop = True
+        try:
+            session.set_crop_bounds(new_bounds)
+            self.refresh_image_plot()
+        finally:
+            self._syncing_crop = False
 
     def update_zoom_label(self, *_):
         """
