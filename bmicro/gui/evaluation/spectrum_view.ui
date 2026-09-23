@@ -75,6 +75,13 @@
      <item>
       <layout class="QVBoxLayout" name="verticalLayout_1">
        <item>
+        <widget class="QComboBox" name="combobox_spectrum_selection">
+         <property name="toolTip">
+          <string>Which frame repeat's spectrum/fit to show. &quot;Combined (sum of repeats)&quot; is the actual spectrum/fit used for this point's reported value when evaluated in 'sum' mode; each &quot;Repeat&quot; entry shows that single frame's own raw spectrum and its own individually-fitted peaks.</string>
+         </property>
+        </widget>
+       </item>
+       <item>
         <widget class="QWidget" name="spectrum_widget" native="true"/>
        </item>
       </layout>

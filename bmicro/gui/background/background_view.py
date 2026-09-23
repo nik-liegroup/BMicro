@@ -56,6 +56,8 @@ class BackgroundView(QtWidgets.QWidget):
         ('y', 'y [µm]'),
         ('z', 'z [µm]'),
         ('brillouin_shift_f', 'Brillouin shift [GHz]'),
+        ('brillouin_shift_f_stokes_anti_stokes',
+         'Brillouin shift S-AS [GHz]'),
         ('rayleigh_peak_position_f', 'Rayleigh position [GHz]'),
         ('brillouin_peak_snr', 'Brillouin SNR'),
         ('rayleigh_peak_snr', 'Rayleigh SNR'),

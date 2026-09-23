@@ -98,6 +98,31 @@
         </widget>
        </item>
        <item>
+        <widget class="QGroupBox" name="evaluationModeGroup">
+         <property name="maximumSize">
+          <size>
+           <width>16777215</width>
+           <height>700</height>
+          </size>
+         </property>
+         <property name="title">
+          <string>Frame repeats</string>
+         </property>
+         <layout class="QHBoxLayout" name="horizontalLayout_evaluation_mode">
+          <item>
+           <widget class="QCheckBox" name="checkbox_evaluate_sum">
+            <property name="toolTip">
+             <string>Unchecked (default): fit each camera frame repeat separately and average the results (unchanged, current behavior). Checked: additionally interpolate every repeat's spectrum onto a common frequency axis, sum them, and fit that single summed spectrum - using it as the reported value for every parameter, instead of the per-frame average - while still fitting each repeat separately underneath, so the frame-spread quality metrics keep working exactly as before. Changing this only takes effect on the next Evaluate run.</string>
+            </property>
+            <property name="text">
+             <string>Fit summed frame repeats</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
         <widget class="QWidget" name="widget" native="true">
          <property name="minimumSize">
           <size>

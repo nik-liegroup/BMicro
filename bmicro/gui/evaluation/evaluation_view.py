@@ -61,6 +61,10 @@ class EvaluationView(QtWidgets.QWidget):
         self.isd_image_colorbar = None
         self.isd_spectrum_canvas = None
         self.isd_spectrum_plot = None
+        # The point currently shown in the spectrum dialog - set on
+        # pixel click, read by on_spectrum_selection_changed() so the
+        # repeat/combined selector can redraw without a new click.
+        self.isd_current_image_key = None
 
         self.button_evaluate.released.connect(self.evaluate)
 
@@ -148,6 +152,9 @@ class EvaluationView(QtWidgets.QWidget):
         self.nrBrillouinPeaks_4.toggled.connect(
             lambda: self.setNrBrillouinPeaks(4))
 
+        self.checkbox_evaluate_sum.clicked.connect(
+            self.on_evaluation_mode_changed)
+
     def update_ui(self):
         session = Session.get_instance()
         evm = session.evaluation_model()
@@ -174,6 +181,12 @@ class EvaluationView(QtWidgets.QWidget):
         elif evm.nr_brillouin_peaks == 4:
             self.nrBrillouinPeaks_4.setChecked(True)
             self.bounds_table.setEnabled(True)
+
+        # checkbox_evaluate_sum.clicked (unlike .toggled) is only
+        # emitted by genuine user interaction, not by setChecked()
+        # here, so this can't re-trigger on_evaluation_mode_changed()'s
+        # own status-bar message on every tab refresh.
+        self.checkbox_evaluate_sum.setChecked(evm.evaluation_mode == 'sum')
 
         self.updateBoundsTable()
         self.setup_parameter_selection_combobox()
@@ -290,83 +303,178 @@ class EvaluationView(QtWidgets.QWidget):
                         .get_figure().colorbar(self.isd_image_map)
         self.isd_image_canvas.draw()
 
-        # Get spectrum and plot it
+        # Remember which point is shown, so the repeat/combined selector
+        # can redraw without needing a new pixel click, and populate it
+        # for this point (frame count can vary in principle).
+        self.isd_current_image_key = image_key
+        self._populate_spectrum_selection(image_key)
+        self._plot_spectrum()
+
+    def _populate_spectrum_selection(self, image_key):
+        """
+        Fills combobox_spectrum_selection with one entry per frame
+        repeat at this point, plus a "Combined" entry when there is
+        more than one repeat - see _plot_spectrum() for what each
+        entry shows. Hidden entirely for a single-repeat point, where
+        there is nothing to choose between.
+        """
+        session = Session.get_instance()
+        evm = session.evaluation_model()
+        spectra = evm.get_spectra(image_key) if evm else None
+        nr_images = len(spectra) if spectra else 0
+
+        combobox = self.image_spectrum_dialog.combobox_spectrum_selection
+        combobox.blockSignals(True)
+        combobox.clear()
+        if nr_images <= 1:
+            combobox.setVisible(False)
+            combobox.addItem('Repeat 1', 0)
+        else:
+            combobox.setVisible(True)
+            combobox.addItem('Combined (sum of repeats)', 'combined')
+            for frame_num in range(nr_images):
+                combobox.addItem(f'Repeat {frame_num + 1}', frame_num)
+            # Default to the combined view in 'sum' mode (it's what's
+            # actually reported), otherwise to the first repeat.
+            if evm is not None and evm.evaluation_mode == 'sum':
+                combobox.setCurrentIndex(0)
+            else:
+                combobox.setCurrentIndex(1)
+        combobox.blockSignals(False)
+
+    def on_spectrum_selection_changed(self):
+        if self.isd_current_image_key is None:
+            return
+        self._plot_spectrum()
+
+    def _plot_spectrum(self):
+        """
+        Plots the spectrum (and, if available, its fit) for
+        self.isd_current_image_key, for whichever entry of
+        combobox_spectrum_selection is currently selected: either a
+        single frame repeat's own raw spectrum and its own
+        individually-fitted peaks (unchanged from before this
+        repeat-selector existed), or - only offered once there is more
+        than one repeat - the actual summed-and-fit-once spectrum used
+        for this point's reported value in 'sum' evaluation_mode (see
+        EvaluationController.get_combined_spectrum()/get_fits_combined()).
+        The combined spectrum trace is always shown when selected
+        (computed live from the cached per-frame spectra, independent
+        of the model's *current* evaluation_mode), but its fit overlay
+        only appears if this point was actually evaluated while in
+        'sum' mode - otherwise the fit arrays are still NaN.
+        """
         self.isd_spectrum_plot.cla()
-        spectra = session.evaluation_model().get_spectra(image_key)
+        self.isd_spectrum_plot.set_xlabel('$f$ [GHz]')
+
+        image_key = self.isd_current_image_key
+        selection = self.image_spectrum_dialog\
+            .combobox_spectrum_selection.currentData()
+        if image_key is None or selection is None:
+            self.isd_spectrum_canvas.draw()
+            return
+
+        session = Session.get_instance()
+        evm = session.evaluation_model()
         cm = session.calibration_model()
-        payload_time = session.get_payload_time(image_key)
-        frequencies = cm.get_frequencies_by_time(payload_time)
+        evc = self.evaluation_controller
 
-        if spectra is not None and frequencies is not None:
+        if selection == 'combined':
+            spectrum, frequencies_axis = evc.get_combined_spectrum(
+                image_key)
+            brillouin_fits, rayleigh_fits = evc.get_fits_combined(image_key)
+            # The combined fit is broadcast into every frame slot -
+            # any one of them (frame 0) is the reported value.
             image_nr = 0
-            spectrum = np.nanmean(spectra, image_nr)
+        else:
+            spectra = evm.get_spectra(image_key) if evm else None
+            resolution = session.get_payload_resolution()
+            indices = self.evaluation_controller.get_indices_from_key(
+                resolution, image_key)
+            times = evm.results['time'][(*indices, slice(None), 0, 0)] \
+                if evm else None
+            frequencies = cm.get_frequencies_by_time(times) \
+                if (cm is not None and times is not None) else None
+            if spectra is None or frequencies is None \
+                    or selection >= len(spectra):
+                self.isd_spectrum_canvas.draw()
+                return
+            spectrum = spectra[selection]
+            frequencies_axis = frequencies[selection]
+            brillouin_fits, rayleigh_fits = evc.get_fits(image_key)
+            image_nr = selection
 
-            # Also try to get the fit
-            brillouin_fits, rayleigh_fits =\
-                self.evaluation_controller.get_fits(image_key)
+        if spectrum is None or frequencies_axis is None:
+            self.isd_spectrum_canvas.draw()
+            return
 
-            # Show the measured data
-            self.isd_spectrum_plot.plot(1e-9 * frequencies[0],
-                                        spectrum, color='tab:blue')
-            self.isd_spectrum_plot.set_xlabel('$f$ [GHz]')
+        # Show the measured data
+        self.isd_spectrum_plot.plot(1e-9 * frequencies_axis,
+                                    spectrum, color='tab:blue')
 
-            pm = session.peak_selection_model()
-            evm = session.evaluation_model()
-            if pm is not None and evm is not None:
-                # Show the Brillouin peaks
-                brillouin_regions = pm.get_brillouin_regions()
-                # Iterate over the regions
-                for region_nr in range(brillouin_fits[0].shape[1]):
-                    x = np.linspace(
-                        brillouin_regions[region_nr][0],
-                        brillouin_regions[region_nr][1],
-                        200
-                    )
-                    # First entry is always a single-peak fit,
-                    # the following entries belong to a multi-peak fit
-                    for peak_nr in range(brillouin_fits[0].shape[2]):
-                        idx = (image_nr, region_nr, peak_nr)
-                        current_fit = lorentz(
-                            x,
-                            brillouin_fits[0][idx],
-                            brillouin_fits[1][idx],
-                            brillouin_fits[2][idx]
-                        )
-                        if peak_nr < 2:
-                            y = current_fit
-                        else:
-                            y += current_fit
-                        if peak_nr == 0:
-                            color = 'tab:red'
-                        else:
-                            color = 'tab:orange'
-                        # We plot the fit for the first and last entry
-                        if peak_nr == 0 or\
-                                peak_nr == (brillouin_fits[0].shape[2] - 1):
-                            self.isd_spectrum_plot.plot(
-                                1e-9 * x,
-                                y + brillouin_fits[3][idx],
-                                color=color
-                            )
+        if brillouin_fits is None or rayleigh_fits is None \
+                or np.all(np.isnan(brillouin_fits[0][image_nr])):
+            # No fit to overlay - e.g. the combined view before this
+            # point was ever evaluated in 'sum' mode.
+            self.isd_spectrum_canvas.draw()
+            return
 
-                # Show the Rayleigh peaks
-                rayleigh_regions = pm.get_rayleigh_regions()
-                # Iterate over the regions
-                for region_nr in range(rayleigh_fits[0].shape[1]):
-                    x = np.linspace(
-                        rayleigh_regions[region_nr][0],
-                        rayleigh_regions[region_nr][1],
-                        200
-                    )
-                    idx = (image_nr, region_nr, 0)
-                    y = lorentz(
+        pm = session.peak_selection_model()
+        if pm is not None and evm is not None:
+            # Show the Brillouin peaks
+            brillouin_regions = pm.get_brillouin_regions()
+            # Iterate over the regions
+            for region_nr in range(brillouin_fits[0].shape[1]):
+                x = np.linspace(
+                    brillouin_regions[region_nr][0],
+                    brillouin_regions[region_nr][1],
+                    200
+                )
+                # First entry is always a single-peak fit,
+                # the following entries belong to a multi-peak fit
+                for peak_nr in range(brillouin_fits[0].shape[2]):
+                    idx = (image_nr, region_nr, peak_nr)
+                    current_fit = lorentz(
                         x,
-                        rayleigh_fits[0][idx],
-                        rayleigh_fits[1][idx],
-                        rayleigh_fits[2][idx]
-                    ) + rayleigh_fits[3][idx]
-                    self.isd_spectrum_plot.plot(1e-9 * x,
-                                                y, color='tab:purple')
+                        brillouin_fits[0][idx],
+                        brillouin_fits[1][idx],
+                        brillouin_fits[2][idx]
+                    )
+                    if peak_nr < 2:
+                        y = current_fit
+                    else:
+                        y += current_fit
+                    if peak_nr == 0:
+                        color = 'tab:red'
+                    else:
+                        color = 'tab:orange'
+                    # We plot the fit for the first and last entry
+                    if peak_nr == 0 or\
+                            peak_nr == (brillouin_fits[0].shape[2] - 1):
+                        self.isd_spectrum_plot.plot(
+                            1e-9 * x,
+                            y + brillouin_fits[3][idx],
+                            color=color
+                        )
+
+            # Show the Rayleigh peaks
+            rayleigh_regions = pm.get_rayleigh_regions()
+            # Iterate over the regions
+            for region_nr in range(rayleigh_fits[0].shape[1]):
+                x = np.linspace(
+                    rayleigh_regions[region_nr][0],
+                    rayleigh_regions[region_nr][1],
+                    200
+                )
+                idx = (image_nr, region_nr, 0)
+                y = lorentz(
+                    x,
+                    rayleigh_fits[0][idx],
+                    rayleigh_fits[1][idx],
+                    rayleigh_fits[2][idx]
+                ) + rayleigh_fits[3][idx]
+                self.isd_spectrum_plot.plot(1e-9 * x,
+                                            y, color='tab:purple')
 
         self.isd_spectrum_canvas.draw()
 
@@ -386,6 +494,9 @@ class EvaluationView(QtWidgets.QWidget):
                 .setWindowTitle('Camera image & spectrum')
             self.image_spectrum_dialog.setWindowModality(
                 QtCore.Qt.WindowModality.NonModal)
+            self.image_spectrum_dialog.combobox_spectrum_selection\
+                .currentIndexChanged.connect(
+                    self.on_spectrum_selection_changed)
 
             self.image_spectrum_dialog.show()
 
@@ -442,6 +553,38 @@ class EvaluationView(QtWidgets.QWidget):
         self.combobox_peak_number.blockSignals(False)
 
         self.updateBoundsTable()
+
+    def on_evaluation_mode_changed(self):
+        """
+        Wired to checkbox_evaluate_sum.clicked (see __init__) - a user-
+        driven toggle of EvaluationModel.evaluation_mode ('sum' vs.
+        'single', see that model for what each means).
+
+        Toggling this does NOT retroactively fill/clear the '_combined'
+        backing arrays for already-evaluated points - those are only
+        (re-)written by evaluate() actually running in the new mode
+        (see EvaluationController.evaluate()). Until Evaluate is
+        re-run, get_data() would otherwise silently start reading
+        all-NaN '_combined' arrays in 'sum' mode. This tab has no
+        existing lighter-weight "results are now stale" indicator for
+        a fit-setting change (changing nr_brillouin_peaks/the bounds
+        table has the same gap - re-evaluating is left entirely to the
+        user there too), so this surfaces the same way BMicro already
+        reports transient status elsewhere (see MainWindow.
+        export_file()'s statusbar.showMessage() calls) rather than
+        failing silently.
+        """
+        session = Session.get_instance()
+        evm = session.evaluation_model()
+        if evm is None:
+            return
+        evm.evaluation_mode = \
+            'sum' if self.checkbox_evaluate_sum.isChecked() else 'single'
+        main_window = self.window()
+        if hasattr(main_window, 'statusbar'):
+            main_window.statusbar.showMessage(
+                'Frame-repeat handling changed - click "Evaluate" to '
+                'apply it to the current results.', 8000)
 
     def boundsChanged(self, row, column):
         session = Session.get_instance()
@@ -536,6 +679,7 @@ class EvaluationView(QtWidgets.QWidget):
         self.label_z_value.setVisible(False)
         self.checkbox_transparent_blocks.setVisible(False)
         self._click_context = None
+        self.isd_current_image_key = None
         # A full figure.clf() + fresh subplot, rather than clear_plots()
         # + plot.cla(): the latter only clears what's *drawn* on the
         # existing Axes, but leaves it (and any layout/subplotspec state
@@ -562,6 +706,7 @@ class EvaluationView(QtWidgets.QWidget):
             self._quality_view._fail_markers = []
         self.updateBoundsTable()
         self.nrBrillouinPeaks_1.setChecked(True)
+        self.checkbox_evaluate_sum.setChecked(False)
         # Blocked for the same reason as combobox_peak_number just
         # below: unblocked, clear() changes the current index and fires
         # currentIndexChanged -> on_select_parameter -> refresh_plot(),
@@ -736,9 +881,12 @@ class EvaluationView(QtWidgets.QWidget):
         self.evaluation_running = True
         self.button_evaluate.setText('Cancel')
         # While the evaluation is running, we
-        # disable switching to multi-peak fit and adjusting bounds
+        # disable switching to multi-peak fit and adjusting bounds,
+        # and changing frame-repeat handling (a fresh evaluate() run
+        # is what applies it - toggling it mid-run would be confusing).
         self.nrBrillouinPeaksGroup.setEnabled(False)
         self.bounds_table.setEnabled(False)
+        self.evaluationModeGroup.setEnabled(False)
         self.evaluation_timer.start(500)
 
         self.plot_count = 0
@@ -803,6 +951,7 @@ class EvaluationView(QtWidgets.QWidget):
             self.evaluation_running = False
             self.button_evaluate.setText('Evaluate')
             self.nrBrillouinPeaksGroup.setEnabled(True)
+            self.evaluationModeGroup.setEnabled(True)
             session = Session.get_instance()
             if session.evaluation_model().nr_brillouin_peaks > 1:
                 self.bounds_table.setEnabled(True)

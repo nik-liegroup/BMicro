@@ -1,3 +1,26 @@
+## 0.14.0 - Unreleased
+
+### Added
+- feat: second Brillouin shift quantity, computed from the distance
+  between the Stokes and Anti-Stokes Brillouin peaks and the VIPA free
+  spectral range instead of relative to the Rayleigh peak (bmlab 0.14.0)
+  - selectable everywhere `brillouin_shift_f` is, plus its own column on
+  the Background tab. Already-analyzed session files pick it up on next
+  open, without re-evaluating (requires a calibration to already be
+  present in that file).
+- feat: "Fit summed frame repeats" checkbox on the Evaluation tab
+  (bmlab 0.14.0's `EvaluationModel.evaluation_mode`) - when checked,
+  camera frame repeats at each point are additionally interpolated
+  onto a common frequency axis, summed, and fit once, and that single
+  sum-fit becomes the reported/plotted/exported value for every
+  parameter, instead of averaging each repeat's own separately-fit
+  value - while every repeat is still fit separately underneath, so
+  the frame-spread quality metrics keep working unchanged. Off by
+  default (matches prior behavior exactly). Takes effect on the next
+  "Evaluate" run - toggling it does not retroactively recompute
+  already-evaluated points, which the tab flags via a status-bar
+  message.
+
 ## 0.13.0 - 2026-09-10
 
 ### Added
