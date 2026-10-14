@@ -78,6 +78,7 @@ class ExtractionView(QtWidgets.QWidget):
     def update_ui(self):
         session = Session.get_instance()
         self.combobox_datasets.clear()
+        self.current_frame = 0
 
         # Reflect whatever crop is already set on the session (e.g. loaded
         # from a session file) without re-triggering the toggle handler,
@@ -92,6 +93,9 @@ class ExtractionView(QtWidgets.QWidget):
 
         calib_keys = session.get_calib_keys(sort_by_time=True)
         self.combobox_datasets.addItems(calib_keys)
+        # The selection handler already ran when the first item was
+        # added, i.e. while the list still had a single entry.
+        self.checkFrameNavigationButtons()
 
     def reset_ui(self):
         self.combobox_datasets.clear()
@@ -101,40 +105,57 @@ class ExtractionView(QtWidgets.QWidget):
         self.checkbox_use_zoom_as_crop.blockSignals(False)
         self.refresh_image_plot()
 
+    def _frame_count(self):
+        calib_key = self.combobox_datasets.currentText()
+        if not calib_key:
+            return 0
+        return Session.get_instance().get_calibration_image_count(calib_key)
+
     def prev_frame(self):
+        """
+        Steps back one frame; from the first frame of a calibration, to
+        the last frame of the previous calibration.
+        """
         if self.current_frame > 0:
             self.current_frame -= 1
             self.refresh_image_plot()
-            self.checkFrameNavigationButtons()
+        elif self.combobox_datasets.currentIndex() > 0:
+            self.combobox_datasets.setCurrentIndex(
+                self.combobox_datasets.currentIndex() - 1)
+            self.current_frame = max(self._frame_count() - 1, 0)
+            self.refresh_image_plot()
+        self.checkFrameNavigationButtons()
 
     def next_frame(self):
-        session = Session.get_instance()
-        calib_key = self.combobox_datasets.currentText()
-        frame_count = session.get_calibration_image_count(calib_key)
-        if self.current_frame < frame_count - 1:
+        """
+        Steps forward one frame; from the last frame of a calibration,
+        to the first frame of the next calibration.
+        """
+        if self.current_frame < self._frame_count() - 1:
             self.current_frame += 1
             self.refresh_image_plot()
-            self.checkFrameNavigationButtons()
+        elif self.combobox_datasets.currentIndex() \
+                < self.combobox_datasets.count() - 1:
+            self.combobox_datasets.setCurrentIndex(
+                self.combobox_datasets.currentIndex() + 1)
+        self.checkFrameNavigationButtons()
 
     def checkFrameNavigationButtons(self):
-        if self.current_frame > 0:
-            self.button_prev_frame.setEnabled(True)
-        else:
-            self.button_prev_frame.setEnabled(False)
-
-        session = Session.get_instance()
-        calib_key = self.combobox_datasets.currentText()
-        if calib_key:
-            frame_count = session.get_calibration_image_count(calib_key)
-            if self.current_frame < frame_count - 1:
-                self.button_next_frame.setEnabled(True)
-            else:
-                self.button_next_frame.setEnabled(False)
+        index = self.combobox_datasets.currentIndex()
+        self.button_prev_frame.setEnabled(
+            self.current_frame > 0 or index > 0)
+        self.button_next_frame.setEnabled(
+            index >= 0 and (
+                self.current_frame < self._frame_count() - 1
+                or index < self.combobox_datasets.count() - 1))
 
     def on_select_dataset(self):
         """
         Action triggered when user selects a calibration dataset.
         """
+        # A different dataset may have fewer frames than the one shown
+        # before, so start again at its first frame.
+        self.current_frame = 0
         self.checkFrameNavigationButtons()
         self.refresh_image_plot()
 

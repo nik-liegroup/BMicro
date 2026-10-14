@@ -3,23 +3,25 @@ from importlib import resources
 import copy
 import hashlib
 import logging
+import os
 import signal
 import sys
 import traceback
 
+import h5py
 import numpy as np
 
-from PyQt6 import QtWidgets, uic, QtCore, QtGui
+from PyQt6 import QtWidgets, uic, QtCore, QtGui, sip
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, \
     QVBoxLayout, QHBoxLayout, QCheckBox, QLabel, QDoubleSpinBox, QWidget
 from PyQt6.QtCore import QSize
 
 from bmlab.session import Session, get_session_file_path
-from bmlab.file import is_source_file
+from bmlab.serializer import Serializer
+from bmlab.file import is_source_file, is_session_file, BrillouinFile
 from bmlab.models.setup import AVAILABLE_SETUPS
 from bmlab.models import EvaluationModel
-from bmlab.controllers import PeakSelectionController, ExportController, \
-    EvaluationController
+from bmlab.controllers import ExportController, EvaluationController
 
 from . import data
 from . import extraction
@@ -28,6 +30,13 @@ from . import peak_selection
 from . import evaluation
 from . import quality
 from . import background
+from bmicro.prefetch import FilePrefetcher
+from .plot_export import export_calibration_plots, evaluated_repetitions
+from .base_settings import setup_signature, orientation_signature, \
+    saved_base_signature, reset_analysis
+from .batch_step_dialog import BatchStepDialog, pending_repetitions, \
+    step_done, DOWNSTREAM_STEPS, calibration_gaps, calibration_gaps_text, \
+    STEP_EXTRACTION, STEP_CALIBRATION, STEP_PEAK_SELECTION
 
 from bmicro import __version__ as bmicroversion
 from bmlab import __version__ as bmlabversion
@@ -98,6 +107,67 @@ class BatchExportWorker(QtCore.QObject):
         self.finished.emit(succeeded, failed)
 
 
+def file_hash(path):
+    """ Key of a file in the batch table. """
+    return hashlib.md5(str(path).encode('utf-8')).hexdigest()
+
+
+def is_analysed(repetition):
+    """
+    Whether a repetition of the batch table has any analysis step done
+    (the batch table's 'progress', see BMicro._refresh_batch_progress()).
+    """
+    return repetition['valid'] \
+        and repetition['progress'] not in (None, 'none')
+
+
+class BatchScanWorker(QtCore.QObject):
+    """
+    Finds the source files below a folder and reads what the batch table
+    shows for each (repetitions, analysis progress) in a background
+    thread. That takes seconds per file, so doing it in the GUI thread
+    froze the window for the whole folder.
+
+    `scan` is the function that reads one file and returns its
+    repetitions (BMicro._scan_batch_repetitions); it must not touch the
+    GUI or the Session.
+    """
+    # number of new source files found
+    found = QtCore.pyqtSignal(int)
+    # index (0-based) of the file about to be scanned, and its path
+    progress = QtCore.pyqtSignal(int, str)
+    # path and repetitions of a scanned file
+    scanned = QtCore.pyqtSignal(object, dict)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, folder, known_hashes, scan):
+        super().__init__()
+        self.folder = folder
+        self.known_hashes = set(known_hashes)
+        self.scan = scan
+        self.aborted = False
+
+    def run(self):
+        try:
+            files = []
+            for h5_file in sorted(pathlib.Path(self.folder).glob('**/*.h5')):
+                if self.aborted:
+                    return
+                if file_hash(h5_file) not in self.known_hashes \
+                        and is_source_file(h5_file):
+                    files.append(h5_file)
+            self.found.emit(len(files))
+            for i, h5_file in enumerate(files):
+                if self.aborted:
+                    return
+                self.progress.emit(i, str(h5_file))
+                self.scanned.emit(h5_file, self.scan(h5_file))
+        except Exception:
+            logger.warning('Scanning %s failed', self.folder, exc_info=True)
+        finally:
+            self.finished.emit()
+
+
 class BMicro(QtWidgets.QMainWindow):
     """
     Class for the main window of BMicro.
@@ -145,6 +215,8 @@ class BMicro(QtWidgets.QMainWindow):
         self.batch_export_worker = None
 
         self.batch_dialog = None
+        self.batch_scan_thread = None
+        self.batch_scan_worker = None
         self.batch_files = {}
         self.batch_config = {
             'setup': {
@@ -191,6 +263,14 @@ class BMicro(QtWidgets.QMainWindow):
                 'export': False,
             },
         }
+        self.batch_reanalyse = False
+        # (file path, step) -> repetitions whose upstream step was redone
+        # during the current batch run, so this step must be redone too.
+        self.batch_forced = {}
+        # (file hash, repetition key or None) per row of the batch table
+        self.batch_rows = []
+        # Loads the next batch files in the background (batch runs only)
+        self.prefetcher = None
         self.batch_evaluation_running = False
         self.batch_evaluation_messages = []
 
@@ -247,7 +327,7 @@ class BMicro(QtWidgets.QMainWindow):
         """ Registers the menu actions """
         self.action_open.triggered.connect(self.open_file)
         self.action_close.triggered.connect(self.close_file)
-        self.action_save.triggered.connect(self.save_session)
+        self.action_save.triggered.connect(self.on_action_save)
         self.action_export.triggered.connect(self.on_action_export_file)
         self.action_exit.triggered.connect(self.exit_app)
 
@@ -269,8 +349,11 @@ class BMicro(QtWidgets.QMainWindow):
             'Please wait for the current export to finish before '
             'opening or closing a file.')
 
-    def open_file(self, file_name=None):
-        """ Show open file dialog and load file. """
+    def open_file(self, file_name=None, update_views=True):
+        """
+        Show open file dialog and load file. `update_views=False` skips
+        filling the tabs, for batch steps that work in their own window.
+        """
         if self.export_running:
             self._warn_export_in_progress()
             return
@@ -288,15 +371,19 @@ class BMicro(QtWidgets.QMainWindow):
                                    str(pathlib.Path(file_name).parent))
 
         session = Session.get_instance()
+        # Ready already if a batch run loaded it in the background
+        preloaded = self.prefetcher.take(file_name) \
+            if self.prefetcher is not None else None
         try:
             self.close_file()
-            session.set_file(file_name)
+            session.set_file(file_name, preloaded=preloaded)
             # Kept inside the try/except too: a valid file can still
             # contain a repetition the UI can't render (e.g. an
             # aborted/restarted acquisition with an empty first
             # repetition), and that shouldn't be able to crash the
             # whole application on open.
-            self.update_ui()
+            if update_views:
+                self.update_ui()
         except FileNotFoundError as e:
             msg = QMessageBox()
             msg.setIcon(QMessageBox.Icon.Warning)
@@ -318,6 +405,37 @@ class BMicro(QtWidgets.QMainWindow):
             return
         Session.get_instance().clear()
         self.reset_ui()
+
+    def on_action_save(self):
+        """
+        Saves the session and, if it holds evaluation results, the
+        calibration plots next to it.
+        """
+        self.save_session()
+        self._save_calibration_plots()
+
+    @staticmethod
+    def _save_calibration_plots(repetitions=None):
+        """
+        Writes the calibration plots of the open file, only for the
+        repetitions that have been evaluated (and are in `repetitions`,
+        if given) - plots are only part of saving an evaluated file.
+        """
+        session = Session.get_instance()
+        if session.file is None:
+            return
+        evaluated = evaluated_repetitions(session)
+        if repetitions is not None:
+            evaluated = [key for key in evaluated if key in repetitions]
+        if not evaluated:
+            return
+        # The session is already saved; a plotting problem must not
+        # turn that into an error.
+        try:
+            export_calibration_plots(session, evaluated)
+        except Exception:
+            logger.warning('Could not save calibration plots',
+                           exc_info=True)
 
     def on_action_export_file(self):
         session = Session.get_instance()
@@ -711,6 +829,8 @@ class BMicro(QtWidgets.QMainWindow):
         self.batch_dialog.button_remove_folder.clicked.connect(
             self.batch_remove_files
         )
+        self.batch_dialog.table_files.itemChanged.connect(
+            self.on_batch_repetition_toggled)
         self.update_batch_file_table()
         # Batch evaluation's export step reuses the same export_config
         # as the regular Export/Batch export dialogs (see
@@ -823,6 +943,11 @@ class BMicro(QtWidgets.QMainWindow):
         }
 
     def update_batch_file_settings(self):
+        # Re-analyse
+        self.batch_dialog.checkBox_reanalyse.setChecked(self.batch_reanalyse)
+        self.batch_dialog.checkBox_reanalyse.clicked.connect(
+            self.on_reanalyse_set)
+
         # Setup
         cfg_setup = self.batch_config['setup']
         self.batch_dialog.checkBox_setup.setChecked(cfg_setup['set'])
@@ -907,10 +1032,15 @@ class BMicro(QtWidgets.QMainWindow):
             .setChecked(cfg_peak_selection['select'])
         self.batch_dialog.checkBox_peak_selection\
             .clicked.connect(self.on_peak_selection_select)
-        self.batch_dialog.tableWidget_Brillouin\
-            .setEnabled(cfg_peak_selection['select'])
-        self.batch_dialog.tableWidget_Rayleigh\
-            .setEnabled(cfg_peak_selection['select'])
+        # The regions are chosen by hand in the peak selection window,
+        # so the preset tables are not needed here.
+        for name in ('label_Brillouin_regions', 'tableWidget_Brillouin',
+                     'button_region_brillouin_add',
+                     'button_region_brillouin_remove',
+                     'label_Rayleigh_regions', 'tableWidget_Rayleigh',
+                     'button_region_rayleigh_add',
+                     'button_region_rayleigh_remove'):
+            getattr(self.batch_dialog, name).hide()
         self.batch_dialog.button_region_brillouin_remove.clicked.connect(
             lambda: self.remove_evaluation_regions(
                 self.batch_dialog.tableWidget_Brillouin,
@@ -1189,6 +1319,7 @@ class BMicro(QtWidgets.QMainWindow):
             .setEnabled(self.batch_config['setup']['set'])
 
         self.update_batch_calibration_frequencies()
+        self._cascade_batch_steps()
 
     def on_orientation_set(self):
         self.batch_config['orientation']['set'] = self.sender().isChecked()
@@ -1196,6 +1327,7 @@ class BMicro(QtWidgets.QMainWindow):
             .setEnabled(self.batch_config['orientation']['set'])
         self.batch_dialog.groupBox_reflection\
             .setEnabled(self.batch_config['orientation']['set'])
+        self._cascade_batch_steps()
 
     def on_rotation_clicked(self):
         """
@@ -1225,24 +1357,55 @@ class BMicro(QtWidgets.QMainWindow):
             self.batch_config['orientation'][
                 'reflection']['horizontally'] = checkbox.isChecked()
 
+    def on_reanalyse_set(self):
+        self.batch_reanalyse = self.sender().isChecked()
+
+    def _cascade_batch_steps(self):
+        """
+        Redoing a step invalidates every step built on it, so ticking
+        one ticks all later ones too: setup / orientation -> extraction
+        -> calibration -> peak selection -> evaluation.
+        """
+        cfg_calibration = self.batch_config['calibration']
+        cfg_peak_selection = self.batch_config['peak-selection']
+        dialog = self.batch_dialog
+
+        if self.batch_config['setup']['set'] \
+                or self.batch_config['orientation']['set']:
+            self.batch_config['extraction']['extract'] = True
+        dialog.checkBox_extraction.setChecked(
+            self.batch_config['extraction']['extract'])
+        if self.batch_config['extraction']['extract']:
+            cfg_calibration['find-peaks'] = True
+            cfg_calibration['calibrate'] = True
+        if cfg_calibration['find-peaks'] or cfg_calibration['calibrate']:
+            cfg_peak_selection['select'] = True
+        if cfg_peak_selection['select']:
+            self.batch_config['evaluation']['evaluate'] = True
+
+        dialog.checkBox_find_peaks.setChecked(cfg_calibration['find-peaks'])
+        dialog.checkBox_calibrate.setChecked(cfg_calibration['calibrate'])
+        dialog.checkBox_peak_selection.setChecked(cfg_peak_selection['select'])
+        self._set_batch_evaluate(self.batch_config['evaluation']['evaluate'])
+
     def on_extraction_set(self):
         self.batch_config['extraction']['extract'] = self.sender().isChecked()
+        self._cascade_batch_steps()
 
     def on_calibration_find_peaks(self):
         self.batch_config['calibration']['find-peaks']\
             = self.sender().isChecked()
+        self._cascade_batch_steps()
 
     def on_calibration_calibrate(self):
         self.batch_config['calibration']['calibrate']\
             = self.sender().isChecked()
+        self._cascade_batch_steps()
 
     def on_peak_selection_select(self):
         self.batch_config['peak-selection']['select']\
             = self.sender().isChecked()
-        self.batch_dialog.tableWidget_Brillouin\
-            .setEnabled(self.batch_config['peak-selection']['select'])
-        self.batch_dialog.tableWidget_Rayleigh\
-            .setEnabled(self.batch_config['peak-selection']['select'])
+        self._cascade_batch_steps()
 
     @staticmethod
     def on_region_changed(region_table, item):
@@ -1256,8 +1419,11 @@ class BMicro(QtWidgets.QMainWindow):
         region_table[row] = current_region
 
     def on_evaluation_evaluate(self):
-        self.batch_config['evaluation']['evaluate']\
-            = self.sender().isChecked()
+        self._set_batch_evaluate(self.sender().isChecked())
+
+    def _set_batch_evaluate(self, evaluate):
+        self.batch_config['evaluation']['evaluate'] = evaluate
+        self.batch_dialog.checkBox_evaluation.setChecked(evaluate)
         self.batch_dialog.nrBrillouinPeaksGroup\
             .setEnabled(self.batch_config['evaluation']['evaluate'])
         self.batch_dialog.group_5b_quality\
@@ -1352,13 +1518,136 @@ class BMicro(QtWidgets.QMainWindow):
             # itself.
             self._warn_export_in_progress()
             return
+        if not self.batch_evaluation_running \
+                and not self._confirm_batch_overwrite():
+            return
         self.batch_evaluation_running = not self.batch_evaluation_running
         if self.batch_evaluation_running:
             self.run_batch_evaluation()
         else:
             self.widget_evaluation_view.evaluation_abort.value = True
 
+    def _confirm_batch_overwrite(self):
+        """
+        Asks for confirmation if this batch run would replace existing
+        results: redoing a step recomputes the ones built on it, which
+        overwrites the saved calibration fits (when extraction is
+        redone) and evaluation results. Returns False if the user
+        cancels. Existing extraction points and peak regions are kept
+        as the starting point, so they don't count.
+        """
+        self._cascade_batch_steps()
+        cfg_calibration = self.batch_config['calibration']
+        ticked = {
+            1: self.batch_config['extraction']['extract'],
+            2: cfg_calibration['find-peaks'] or cfg_calibration['calibrate'],
+            3: self.batch_config['peak-selection']['select'],
+        }
+        evaluate = self.batch_config['evaluation']['evaluate']
+
+        lose_fits, lose_results, files = 0, 0, set()
+        for file in self.batch_files.values():
+            selected = self._selected_batch_repetitions(file)
+            for key, rep in file.get('repetitions', {}).items():
+                if not rep['valid'] \
+                        or (selected is not None and key not in selected) \
+                        or rep['progress'] not in self.PROGRESS_STEPS:
+                    continue
+                done = self.PROGRESS_STEPS.index(rep['progress'])
+                redone = [step for step, on in ticked.items() if on and (
+                    self.batch_reanalyse or done < step)]
+                fits = bool(redone) and min(redone) <= 1 and done >= 2
+                # Evaluation alone only runs on repetitions that are not
+                # evaluated yet, unless everything is redone
+                results = (bool(redone) or (
+                    evaluate and self.batch_reanalyse)) and done >= 4
+                lose_fits += fits
+                lose_results += results
+                if fits or results:
+                    files.add(file['path'])
+        # Setup/orientation are only changed on analysed files when
+        # re-analysing, and then reset every analysed repetition of the
+        # file (see _apply_batch_base_settings()) - but only those whose
+        # saved setup/orientation really differs from the batch's
+        reset_paths, unknown_paths = [], []
+        cfg_setup = self.batch_config['setup']
+        cfg_orientation = self.batch_config['orientation']
+        if self.batch_reanalyse and (cfg_setup['set']
+                                     or cfg_orientation['set']):
+            wanted_setup = setup_signature(cfg_setup['setup'])
+            wanted_orientation = orientation_signature(
+                cfg_orientation['rotation'], cfg_orientation['reflection'])
+            for file in self.batch_files.values():
+                analysed = [rep for rep in
+                            (file.get('repetitions') or {}).values()
+                            if is_analysed(rep)]
+                if not analysed:
+                    continue
+                saved = analysed[0].get('saved_base')
+                if saved is None:
+                    unknown_paths.append(file['path'])
+                elif (cfg_setup['set'] and saved[0] != wanted_setup) or (
+                        cfg_orientation['set']
+                        and saved[1] != wanted_orientation):
+                    reset_paths.append(file['path'])
+            files.update(reset_paths, unknown_paths)
+        if not files:
+            return True
+
+        lines = []
+        if lose_fits:
+            lines.append(f'{lose_fits} repetition(s): calibration fits')
+        if lose_results:
+            lines.append(f'{lose_results} repetition(s): evaluation results')
+        if reset_paths:
+            names = [pathlib.Path(path).name for path in reset_paths]
+            lines.append(
+                f'{len(reset_paths)} analysed file(s) get a different '
+                f'setup/orientation than saved - every analysis step of '
+                f'all their repetitions is reset: '
+                + ', '.join(names[:8]) + (', ...' if len(names) > 8 else ''))
+        if unknown_paths:
+            lines.append(
+                f'{len(unknown_paths)} analysed file(s): the saved '
+                f'setup/orientation could not be read - the analysis is '
+                f'reset if they differ')
+        box = QMessageBox(self.batch_dialog)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle('Replace existing analysis?')
+        box.setText(
+            f'This run redoes analysis steps that other results depend '
+            f'on. In {len(files)} file(s) the following existing results '
+            f'will be replaced:')
+        box.setInformativeText('\n'.join(lines))
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Ok
+            | QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        return box.exec() == QMessageBox.StandardButton.Ok
+
     def run_batch_evaluation(self):
+        # Background loading of the next files; 'batch/prefetch-files'
+        # in the settings file sets how many (0 switches it off).
+        try:
+            nr_prefetch = int(self.settings.value('batch/prefetch-files', 5))
+        except (TypeError, ValueError):
+            nr_prefetch = 5
+        self.prefetcher = FilePrefetcher(max_files=nr_prefetch) \
+            if nr_prefetch > 0 else None
+        try:
+            self._run_batch_evaluation()
+        finally:
+            if self.prefetcher is not None:
+                self.prefetcher.shutdown()
+            self.prefetcher = None
+
+    def _prefetch_batch_files(self, files, position):
+        """ Starts loading the files after `position` (up to 5). """
+        if self.prefetcher is not None:
+            self.prefetcher.request(
+                [file['path'] for file in files[position + 1:]])
+
+    def _run_batch_evaluation(self):
         self.batch_dialog.button_start_cancel.setText('Cancel')
         self.batch_dialog.progressBar.setMaximum(len(self.batch_files))
         self.batch_dialog.progressBar.setValue(0)
@@ -1370,7 +1659,29 @@ class BMicro(QtWidgets.QMainWindow):
         # the end instead of only ever showing up as an unexplained
         # "failed" icon in the file table.
         self.batch_evaluation_messages = []
+        self.batch_forced = {}
+        self._cascade_batch_steps()
+
+        # Extraction, calibration and peak selection need the user, so
+        # they run first, one step at a time over all files.
+        cfg_calibration = self.batch_config['calibration']
+        interactive_steps = []
+        if self.batch_config['extraction']['extract']:
+            interactive_steps.append(STEP_EXTRACTION)
+        if cfg_calibration['find-peaks'] or cfg_calibration['calibrate']:
+            interactive_steps.append(STEP_CALIBRATION)
+        if self.batch_config['peak-selection']['select']:
+            interactive_steps.append(STEP_PEAK_SELECTION)
+        for step in interactive_steps:
+            self.run_batch_interactive_step(step)
+            if not self.batch_evaluation_running:
+                break
+
+        batch_files = list(self.batch_files.values())
         for i, (file_hash, file) in enumerate(self.batch_files.items()):
+            if not self.batch_evaluation_running:
+                break
+            self._prefetch_batch_files(batch_files, i - 1)
             try:
                 self.evaluate_batch_file(file)
             except BaseException as e:
@@ -1417,72 +1728,34 @@ class BMicro(QtWidgets.QMainWindow):
         session = Session.get_instance()
 
         rep_keys = session.file.repetition_keys()
+        selected = self._selected_batch_repetitions(file)
+        if selected is not None:
+            rep_keys = [key for key in rep_keys if key in selected]
 
         for rep_key in rep_keys:
             # Load repetition
             session.set_current_repetition(rep_key)
             QtCore.QCoreApplication.instance().processEvents()
 
-            # Setup
-            cfg_setup = self.batch_config['setup']
-            if cfg_setup['set']:
-                session.set_setup(cfg_setup['setup'])
+            # Setup and orientation (already applied in
+            # run_batch_interactive_step(); a no-op then)
+            self._apply_batch_base_settings(file)
 
-            # Orientation
-            cfg_orientation = self.batch_config['orientation']
-            if cfg_orientation['set']:
-                session.set_rotation(cfg_orientation['rotation'])
-                session.set_reflection(
-                    vertically=cfg_orientation['reflection']['vertically'],
-                    horizontally=cfg_orientation['reflection']['horizontally']
-                )
-
-            # Extraction
-            cfg_extraction = self.batch_config['extraction']
-            if cfg_extraction['extract']:
-                self.tabWidget.setCurrentIndex(1)
-                if self.aborted(file):
-                    return
-                QtCore.QCoreApplication.instance().processEvents()
-                self.widget_extraction_view.find_points_all()
-
-            # Calibration
-            cfg_calibration = self.batch_config['calibration']
-            if cfg_calibration['find-peaks'] or\
-                    cfg_calibration['calibrate']:
-                self.tabWidget.setCurrentIndex(2)
-                if self.aborted(file):
-                    return
-                QtCore.QCoreApplication.instance().processEvents()
-                if not cfg_calibration['find-peaks']:
-                    self.widget_calibration_view.\
-                        calibrate_all(do_not='find_peaks')
-                elif not cfg_calibration['calibrate']:
-                    self.widget_calibration_view.\
-                        calibrate_all(do_not='calibrate')
-                else:
-                    self.widget_calibration_view.calibrate_all()
-
-            # PeakSelection
-            cfg_peak_selection = self.batch_config['peak-selection']
-            if cfg_peak_selection['select']:
-                self.tabWidget.setCurrentIndex(3)
-                if self.aborted(file):
-                    return
-                QtCore.QCoreApplication.instance().processEvents()
-                psc = PeakSelectionController()
-                for brillouin_region \
-                        in cfg_peak_selection['brillouin_regions']:
-                    psc.add_brillouin_region_frequency(brillouin_region)
-                for rayleigh_region \
-                        in cfg_peak_selection['rayleigh_regions']:
-                    psc.add_rayleigh_region_frequency(rayleigh_region)
-                self.widget_peak_selection_view.update_ui()
-                QtCore.QCoreApplication.instance().processEvents()
+            # Extraction, calibration and peak selection were already
+            # done interactively before this loop (see
+            # run_batch_interactive_step()).
 
             # Evaluation
             cfg_evaluation = self.batch_config['evaluation']
             if cfg_evaluation['evaluate']:
+                # A repetition that is evaluated already keeps its
+                # results unless 'Re-analyse finished files' is ticked.
+                # (Upstream steps redone in this run bring the
+                # repetition's progress below 'evaluation' again.)
+                progress = (file.get('repetitions') or {}).get(
+                    rep_key, {}).get('progress')
+                if progress == 'evaluation' and not self.batch_reanalyse:
+                    continue
                 self.tabWidget.setCurrentIndex(4)
                 if self.aborted(file):
                     return
@@ -1515,18 +1788,25 @@ class BMicro(QtWidgets.QMainWindow):
                 if not pm.get_brillouin_regions() \
                         or not pm.get_rayleigh_regions():
                     missing.append(
-                        "no Brillouin/Rayleigh peak regions selected "
-                        "('Select peaks' isn't ticked to define them "
-                        "for this batch run)")
+                        "no Brillouin/Rayleigh peak regions selected")
                 if cm.frequencies_by_time_interpolator is None:
-                    missing.append(
-                        "no valid calibration ('Calibrate' isn't "
-                        "ticked to create one for this batch run)")
+                    missing.append("no valid calibration")
                 if missing:
                     self.batch_evaluation_messages.append(
                         f"{file['path']} repetition {rep_key}: "
                         f"skipped evaluation - {'; '.join(missing)}.")
                     continue
+
+                # Still evaluated, but flagged: the missing calibrations
+                # are interpolated over from the remaining ones.
+                gaps = calibration_gaps_text(*calibration_gaps(
+                    session.get_calib_keys() or [],
+                    session.extraction_model(), cm))
+                if gaps:
+                    self.batch_evaluation_messages.append(
+                        f"{file['path']} repetition {rep_key}: "
+                        f"evaluated with incomplete calibrations "
+                        f"({gaps}).")
 
                 evc = EvaluationController()
                 evc.set_nr_brillouin_peaks(
@@ -1581,7 +1861,11 @@ class BMicro(QtWidgets.QMainWindow):
                 return
             QtCore.QCoreApplication.instance().processEvents()
             try:
-                ExportController().export(self.export_config)
+                export_config = copy.deepcopy(self.export_config)
+                # Only the repetitions ticked in the batch table.
+                export_config['brillouin']['repetitions'] = \
+                    None if selected is None else sorted(selected)
+                ExportController().export(export_config)
             except Exception as e:
                 # Don't let an export problem lose the evaluation work
                 # already done above - still fall through to save it.
@@ -1594,6 +1878,9 @@ class BMicro(QtWidgets.QMainWindow):
 
         # Save the evaluated data
         self.save_session()
+        self._refresh_file_progress(file)
+        if self.batch_config['evaluation']['evaluate']:
+            self._save_calibration_plots(selected)
         if self.aborted(file):
             return
         QtCore.QCoreApplication.instance().processEvents()
@@ -1609,6 +1896,173 @@ class BMicro(QtWidgets.QMainWindow):
         # attention behind a checkmark.
         file['status'] = 'failed' if export_failed else 'success'
         self.update_batch_file_table()
+
+    def _apply_batch_base_settings(self, file):
+        """
+        Sets the batch dialog's setup and orientation on the open file.
+
+        They are the base of every analysis step: for a file that has
+        been analysed already they are left as saved, unless 'Re-analyse
+        finished files' is ticked. And when they are changed there, what
+        was built on them is outdated and is reset - a new orientation
+        changes the geometry of the extraction points (all steps from
+        extraction on), a new setup the calibration (from calibration
+        on) - instead of being kept as a starting point. Both are
+        properties of the file, so every analysed repetition is reset,
+        ticked in the batch table or not.
+        """
+        cfg_setup = self.batch_config['setup']
+        cfg_orientation = self.batch_config['orientation']
+        if not (cfg_setup['set'] or cfg_orientation['set']):
+            return
+        session = Session.get_instance()
+        reflection = cfg_orientation['reflection']
+        setup_changes = cfg_setup['set'] and setup_signature(
+            cfg_setup['setup']) != setup_signature(session.setup)
+        orientation_changes = cfg_orientation['set'] \
+            and orientation_signature(
+                session.orientation.rotation,
+                session.orientation.reflection) != orientation_signature(
+                    cfg_orientation['rotation'], reflection)
+        if not (setup_changes or orientation_changes):
+            return
+
+        analysed = [key for key, rep in (file.get('repetitions') or {}).items()
+                    if is_analysed(rep)]
+        if analysed and not self.batch_reanalyse:
+            message = (f"{file['path']}: setup/orientation left as saved - "
+                       f"the file is analysed already (tick 'Re-analyse "
+                       f"finished files' to change them and redo the "
+                       f"analysis).")
+            if message not in self.batch_evaluation_messages:
+                self.batch_evaluation_messages.append(message)
+            return
+
+        if setup_changes:
+            session.set_setup(cfg_setup['setup'])
+        if orientation_changes:
+            session.set_rotation(cfg_orientation['rotation'])
+            session.set_reflection(
+                vertically=reflection['vertically'],
+                horizontally=reflection['horizontally'])
+        if analysed:
+            reset_analysis(session, analysed, orientation_changes)
+            first_reset = 'extraction' if orientation_changes \
+                else 'calibration'
+            self.batch_evaluation_messages.append(
+                f"{file['path']}: setup/orientation changed - analysis "
+                f"of repetition(s) {', '.join(map(str, analysed))} reset "
+                f"from {first_reset} on.")
+
+    def run_batch_interactive_step(self, step):
+        """
+        Runs one manual step (extraction, calibration or peak
+        selection) over all files of the batch: for each file that
+        still has the step open in at least one repetition, opens the
+        file in a window with the regular view, waits until the user
+        closes it, and saves the session. Files where the step is
+        already complete are skipped.
+        """
+        session = Session.get_instance()
+        files = list(self.batch_files.values())
+
+        for position, file in enumerate(files, start=1):
+            file['status'] = 'in-process'
+            self.update_batch_file_table()
+            QtCore.QCoreApplication.instance().processEvents()
+            try:
+                self._prefetch_batch_files(files, position - 2)
+                self.open_file(file['path'], update_views=False)
+                # While this file is worked on, the next ones load.
+                self._prefetch_batch_files(files, position - 1)
+                if session.file is None:
+                    raise RuntimeError('the file could not be opened')
+
+                # Setup and orientation determine the images the user
+                # works on, so they must be set before the dialog opens.
+                self._apply_batch_base_settings(file)
+
+                forced = self.batch_forced.get(
+                    (str(file['path']), step), set())
+                pending = pending_repetitions(
+                    step, include_done=self.batch_reanalyse, forced=forced,
+                    allowed=self._selected_batch_repetitions(file))
+                if pending:
+                    # Whatever is redone here makes the steps built on
+                    # it outdated for these repetitions.
+                    for downstream in DOWNSTREAM_STEPS[step]:
+                        self.batch_forced.setdefault(
+                            (str(file['path']), downstream),
+                            set()).update(pending)
+                    self._prefill_batch_step(step, pending, file, forced)
+                    dialog = BatchStepDialog(
+                        self, step, file['path'], position, len(files),
+                        pending)
+                    dialog.exec()
+                    stop = dialog.stop_requested
+                    # The dialog is parented to this window, so it (and
+                    # its views and figures) would otherwise pile up
+                    # with every file of the batch. deleteLater() is not
+                    # enough: inside this loop, which never returns to
+                    # the event loop it was called from, it would only
+                    # delete them once the whole batch is over.
+                    sip.delete(dialog)
+                    self.save_session()
+                    self._refresh_file_progress(file)
+                    if stop:
+                        self.batch_evaluation_running = False
+                file['status'] = 'pending'
+            except BaseException as e:
+                file['status'] = 'failed'
+                self.batch_evaluation_messages.append(
+                    f"{file['path']}: {step} failed - {e}")
+                logger.warning(
+                    'Batch %s failed for %s', step, file['path'],
+                    exc_info=True)
+            finally:
+                self.close_file()
+                self.update_batch_file_table()
+                QtCore.QCoreApplication.instance().processEvents()
+            if not self.batch_evaluation_running:
+                for other in files:
+                    if other['status'] == 'pending':
+                        other['status'] = 'aborted'
+                self.batch_dialog.progressBar.setValue(0)
+                return
+
+    def _prefill_batch_step(self, step, repetitions, file, forced):
+        """
+        Runs the batch dialog's automatic calibration settings (find
+        peaks / calibrate) on the repetitions still open - or outdated
+        because extraction was redone - as a starting point for the
+        user in the calibration window.
+        """
+        session = Session.get_instance()
+        previous = session.current_repetition_key()
+        try:
+            for rep_key in repetitions:
+                session.set_current_repetition(rep_key)
+                if step_done(step, session) and rep_key not in forced:
+                    # Re-analysis: keep the existing results as they are.
+                    continue
+                if step == STEP_CALIBRATION:
+                    cfg = self.batch_config['calibration']
+                    if not step_done(STEP_EXTRACTION, session):
+                        self.batch_evaluation_messages.append(
+                            f"{file['path']} repetition {rep_key}: "
+                            f"extraction is incomplete, so calibration "
+                            f"was not prefilled.")
+                        continue
+                    view = self.widget_calibration_view
+                    view.update_ui()
+                    if not cfg['find-peaks']:
+                        view.calibrate_all(do_not='find_peaks')
+                    elif not cfg['calibrate']:
+                        view.calibrate_all(do_not='calibrate')
+                    else:
+                        view.calibrate_all()
+        finally:
+            session.set_current_repetition(previous)
 
     def aborted(self, file):
         if not self.batch_evaluation_running:
@@ -1626,34 +2080,280 @@ class BMicro(QtWidgets.QMainWindow):
             directory=self.settings.value("path/last-used")
         )
 
-        if not folder_name:
+        if not folder_name or self.batch_scan_thread is not None:
             return
 
-        # Find all h5 files in the selected folder
-        h5_files = pathlib.Path(folder_name).glob('**/*.h5')
+        # Find the source files in the selected folder that are not in
+        # the batch yet and read their repetitions/progress in a
+        # background thread, so that the window stays responsive and
+        # shows how far it is.
+        progress_dialog = QtWidgets.QDialog(
+            self.batch_dialog,
+            QtCore.Qt.WindowType.WindowTitleHint |
+            QtCore.Qt.WindowType.WindowCloseButtonHint
+        )
+        progress_dialog.setWindowTitle('Loading folder')
+        progress_dialog.setWindowModality(
+            QtCore.Qt.WindowModality.ApplicationModal)
+        label = QLabel('Searching for files...')
+        label.setWordWrap(True)
+        progress_bar = QtWidgets.QProgressBar()
+        progress_bar.setRange(0, 0)  # busy until the number of files is known
+        button_cancel = QtWidgets.QPushButton('Cancel')
+        layout = QVBoxLayout()
+        layout.addWidget(label)
+        layout.addWidget(progress_bar)
+        layout.addWidget(button_cancel)
+        progress_dialog.setLayout(layout)
+        progress_dialog.resize(QSize(500, 120))
 
-        # Add source files to batch if not present yet
-        for h5_file in h5_files:
-            h5_file_md5 = hashlib.md5(str(h5_file).encode('utf-8')).hexdigest()
-            if is_source_file(h5_file)\
-                    and h5_file_md5 not in self.batch_files:
-                self.batch_files[h5_file_md5] = {
-                    'path': h5_file,
-                    'status': 'pending',
-                }
+        self.batch_scan_thread = QtCore.QThread()
+        self.batch_scan_worker = BatchScanWorker(
+            folder_name, self.batch_files.keys(),
+            self._scan_batch_repetitions)
+        worker, thread = self.batch_scan_worker, self.batch_scan_thread
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        thread.finished.connect(thread.deleteLater)
+        total = []
 
-        self.update_batch_file_table()
+        def on_found(count):
+            total.append(count)
+            progress_bar.setRange(0, max(count, 1))
+            label.setText(f'{count} file(s) found' if count
+                          else 'No new files found')
+
+        def on_progress(i, path):
+            label.setText(f'File {i + 1} / {total[0]}\n{path}')
+            progress_bar.setValue(i)
+
+        def on_scanned(path, repetitions):
+            self.batch_files[file_hash(path)] = {
+                'path': path,
+                'status': 'pending',
+                'repetitions': repetitions,
+            }
+            # Rebuilding the table for every file would be slow
+            if len(self.batch_files) % 10 == 0:
+                self.update_batch_file_table()
+
+        def on_finished():
+            thread.quit()
+            worker.deleteLater()
+            self.batch_scan_thread = None
+            self.batch_scan_worker = None
+            progress_dialog.close()
+            self.update_batch_file_table()
+
+        worker.found.connect(on_found)
+        worker.progress.connect(on_progress)
+        worker.scanned.connect(on_scanned)
+        worker.finished.connect(on_finished)
+        # Cancel (or closing the window) keeps the files scanned so far
+        button_cancel.clicked.connect(
+            lambda: setattr(worker, 'aborted', True))
+        progress_dialog.rejected.connect(
+            lambda: setattr(worker, 'aborted', True))
+
+        progress_dialog.show()
+        thread.start()
+
+    @staticmethod
+    def _scan_batch_repetitions(path):
+        """
+        Lists the repetitions of a source file for the batch table:
+        {key: {'label', 'valid', 'checked'}}. A repetition without
+        grid data (an aborted/restarted acquisition that never wrote
+        any positions or spectra) is not valid and can't be ticked.
+        Of the valid ones only the one with the most spectra starts
+        ticked. The label shows the total measurement time to tell restarts
+        apart.
+        Returns an empty dict if the file can't be scanned, which
+        means "all repetitions".
+        """
+        repetitions = {}
+        try:
+            file = BrillouinFile(path)
+        except Exception:
+            logger.warning('Could not scan %s', path, exc_info=True)
+            return repetitions
+        try:
+            for key in file.repetition_keys():
+                try:
+                    repetition = file.get_repetition(key)
+                    resolution = repetition.payload.resolution
+                    image_keys = repetition.payload.image_keys()
+                    nr_spectra = len(image_keys)
+                    # Total measurement time: first to last spectrum.
+                    dates = [repetition.payload.get_date(k)
+                             for k in image_keys]
+                    duration = (max(dates) - min(dates)).total_seconds() \
+                        if dates else 0
+                    hours, rest = divmod(int(round(duration)), 3600)
+                    duration_text = '%d:%02d:%02d' % (
+                        hours, *divmod(rest, 60))
+                except Exception:
+                    resolution, nr_spectra, duration_text = None, 0, '?'
+                try:
+                    calib_keys = list(repetition.calibration.image_keys())
+                except Exception:
+                    calib_keys = []
+                valid = resolution is not None and nr_spectra > 0
+                label = f'Repetition {key} - measured {duration_text} h'
+                if valid:
+                    label += ' - %d x %d x %d grid, %d spectra' % (
+                        *resolution, nr_spectra)
+                else:
+                    label += ' - no grid data'
+                repetitions[key] = {
+                    'label': label, 'valid': valid, 'checked': False,
+                    'calib_keys': calib_keys, 'progress': None,
+                    'nr_spectra': nr_spectra}
+        finally:
+            file.close()
+        # By default only the repetition with the most measurement
+        # points is analysed (the latest one if several are equal); the
+        # others can be ticked by hand.
+        valid_keys = [key for key, rep in repetitions.items()
+                      if rep['valid']]
+        if valid_keys:
+            best = max(reversed(valid_keys),
+                       key=lambda key: repetitions[key]['nr_spectra'])
+            repetitions[best]['checked'] = True
+        BMicro._refresh_batch_progress(path, repetitions)
+        return repetitions
+
+    @staticmethod
+    def _refresh_batch_progress(path, repetitions):
+        """
+        Sets rep['progress'] for every repetition to the last analysis
+        step completed so far ('none', 'extraction', 'calibration',
+        'peak selection' or 'evaluation'), read from the saved session
+        file without touching the open session. Each step counts only
+        if all earlier ones are done too.
+        """
+        session_path = get_session_file_path(path)
+        models = None
+        try:
+            if os.path.exists(session_path) \
+                    and is_session_file(session_path):
+                with h5py.File(session_path, 'r') as f:
+                    models = Serializer.deserialize(f['session'])
+        except Exception:
+            logger.warning(
+                'Could not read progress from %s', session_path,
+                exc_info=True)
+        # The file's saved setup and orientation (the same for all its
+        # repetitions), to tell beforehand where changing them would
+        # reset the analysis
+        saved_base = saved_base_signature(models) \
+            if models is not None else None
+        for key, rep in repetitions.items():
+            progress = 'none'
+            rep['warning'] = None
+            rep['saved_base'] = saved_base
+            try:
+                if models is not None and rep['valid']:
+                    em = models.extraction_models[key]
+                    cm = models.calibration_models[key]
+                    pm = models.peak_selection_models[key]
+                    evm = models.evaluation_models[key]
+                    calib_keys = rep['calib_keys']
+                    total, no_arc, no_fit = calibration_gaps(
+                        calib_keys, em, cm)
+                    # Only a partly done step is worth a warning; one
+                    # that hasn't been started shows up as progress.
+                    rep['warning'] = calibration_gaps_text(
+                        total,
+                        no_arc if 0 < no_arc < total else 0,
+                        no_fit if 0 < no_fit < total else 0)
+                    steps = [
+                        ('extraction', all(
+                            len(em.get_points(k)) >= 3
+                            for k in calib_keys)),
+                        ('calibration', all(
+                            k in cm.frequencies for k in calib_keys)),
+                        # Sessions from before the GHz regions (see
+                        # Session.run_migrations()) have neither yet.
+                        ('peak selection', bool(
+                            getattr(pm, 'brillouin_regions_f', None)
+                            and getattr(pm, 'rayleigh_regions_f', None))),
+                        ('evaluation', bool(np.any(np.isfinite(
+                            evm.results['brillouin_peak_position_f'])))),
+                    ]
+                    for name, done in steps:
+                        if not done:
+                            break
+                        progress = name
+            except Exception:
+                progress = 'unknown'
+            rep['progress'] = progress
+
+    PROGRESS_STEPS = ['none', 'extraction', 'calibration',
+                      'peak selection', 'evaluation']
+
+    @staticmethod
+    def _progress_text(progress):
+        if progress == 'none':
+            return 'not analysed yet'
+        if progress in (None, 'unknown'):
+            return 'progress unknown'
+        return 'analysed up to: ' + progress
+
+    def _file_progress_text(self, file):
+        """
+        The least advanced progress of the file's usable repetitions,
+        plus a warning if any of them has incomplete calibrations.
+        """
+        reps = [rep for rep in file.get('repetitions', {}).values()
+                if rep['valid']]
+        progress = [rep['progress'] for rep in reps]
+        if not progress:
+            return 'no repetitions to analyse'
+        if any(p not in self.PROGRESS_STEPS for p in progress):
+            text = self._progress_text('unknown')
+        else:
+            text = self._progress_text(
+                min(progress, key=self.PROGRESS_STEPS.index))
+        if any(rep.get('warning') for rep in reps):
+            text += ' - WARNING: incomplete calibrations'
+        return text
+
+    def _refresh_file_progress(self, file):
+        self._refresh_batch_progress(
+            file['path'], file.get('repetitions', {}))
+
+    @staticmethod
+    def _selected_batch_repetitions(file):
+        """
+        The repetition keys ticked for `file` in the batch table, or
+        None if the file has no repetition list (use all of them).
+        """
+        repetitions = file.get('repetitions')
+        if not repetitions:
+            return None
+        return {key for key, rep in repetitions.items()
+                if rep['valid'] and rep['checked']}
+
+    def on_batch_repetition_toggled(self, item):
+        row = item.row()
+        if row >= len(self.batch_rows):
+            return
+        file_hash, rep_key = self.batch_rows[row]
+        if rep_key is None:
+            return
+        self.batch_files[file_hash]['repetitions'][rep_key]['checked'] = \
+            item.checkState() == QtCore.Qt.CheckState.Checked
 
     def batch_remove_files(self):
         table = self.batch_dialog.table_files
-        selected_ranges = table.selectedRanges()
-        hashes = list(self.batch_files.keys())
-        hashes_remove = []
-        for selected_range in selected_ranges:
-            start = selected_range.topRow()
-            end = selected_range.bottomRow()
-            for i in range(start, end + 1):
-                hashes_remove.append(hashes[i])
+        hashes_remove = set()
+        for selected_range in table.selectedRanges():
+            for i in range(selected_range.topRow(),
+                           selected_range.bottomRow() + 1):
+                file_hash, rep_key = self.batch_rows[i]
+                if rep_key is None:
+                    hashes_remove.add(file_hash)
         for hash_remove in hashes_remove:
             self.batch_files.pop(hash_remove)
         table.clearSelection()
@@ -1664,8 +2364,15 @@ class BMicro(QtWidgets.QMainWindow):
         table.setTextElideMode(QtCore.Qt.TextElideMode.ElideRight)
         table.setWordWrap(False)
         table.setColumnCount(2)
-        table.setRowCount(len(self.batch_files))
         table.blockSignals(True)
+
+        # One row per file, followed by one row per repetition of it.
+        self.batch_rows = []
+        for file_hash, file in self.batch_files.items():
+            self.batch_rows.append((file_hash, None))
+            for rep_key in file.get('repetitions', {}):
+                self.batch_rows.append((file_hash, rep_key))
+        table.setRowCount(len(self.batch_rows))
 
         pending_icon_path = str(pathlib.Path(self.imdir) / "pending.svg")
         inprocess_icon_path = str(pathlib.Path(self.imdir) / "in-process.svg")
@@ -1674,8 +2381,33 @@ class BMicro(QtWidgets.QMainWindow):
         failed_icon_path = str(pathlib.Path(self.imdir) / "error.svg")
         aborted_icon_path = str(pathlib.Path(self.imdir) / "cancel.svg")
 
-        for rowIdx, (file_hash, file) in enumerate(self.batch_files.items()):
-            table.setIconSize(QtCore.QSize(20, 20))
+        table.setIconSize(QtCore.QSize(20, 20))
+        for rowIdx, (file_hash, rep_key) in enumerate(self.batch_rows):
+            file = self.batch_files[file_hash]
+            if rep_key is not None:
+                rep = file['repetitions'][rep_key]
+                check = QtWidgets.QTableWidgetItem()
+                text = '    ' + rep['label']
+                if rep['valid']:
+                    text += ' - ' + self._progress_text(rep['progress'])
+                    if rep.get('warning'):
+                        text += ' - WARNING: ' + rep['warning']
+                label = QtWidgets.QTableWidgetItem(text)
+                if rep['valid']:
+                    check.setFlags(
+                        QtCore.Qt.ItemFlag.ItemIsUserCheckable |
+                        QtCore.Qt.ItemFlag.ItemIsEnabled)
+                    check.setCheckState(
+                        QtCore.Qt.CheckState.Checked if rep['checked']
+                        else QtCore.Qt.CheckState.Unchecked)
+                    label.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
+                else:
+                    # Greyed out: nothing to analyse in this repetition.
+                    check.setFlags(QtCore.Qt.ItemFlag.NoItemFlags)
+                    label.setFlags(QtCore.Qt.ItemFlag.NoItemFlags)
+                table.setItem(rowIdx, 0, check)
+                table.setItem(rowIdx, 1, label)
+                continue
             status = file['status']
             if status == 'in-process':
                 icon_path = inprocess_icon_path
@@ -1693,7 +2425,8 @@ class BMicro(QtWidgets.QMainWindow):
             entry.setIcon(icon)
             table.setItem(rowIdx, 0, entry)
 
-            path = QtWidgets.QTableWidgetItem(str(file['path']))
+            path = QtWidgets.QTableWidgetItem(
+                f"{file['path']}   [{self._file_progress_text(file)}]")
             table.setItem(rowIdx, 1, path)
         table.setColumnWidth(0, 18)
         table.horizontalHeader().setStretchLastSection(True)

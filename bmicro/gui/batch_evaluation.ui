@@ -66,6 +66,16 @@
             </widget>
            </item>
            <item>
+            <widget class="QCheckBox" name="checkBox_reanalyse">
+             <property name="toolTip">
+              <string>Also redo setup, orientation, extraction, calibration, peak selection and evaluation for repetitions where these are already done. Existing extraction points and peak regions are kept as the starting point, except after a changed setup or orientation, where everything built on it is reset. Without this, finished steps are skipped.</string>
+             </property>
+             <property name="text">
+              <string>Re-analyse finished files</string>
+             </property>
+            </widget>
+           </item>
+           <item>
             <widget class="QPushButton" name="button_remove_folder">
              <property name="minimumSize">
               <size>

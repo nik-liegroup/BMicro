@@ -9,6 +9,7 @@ from bmlab.session import Session
 from bmlab.controllers import PeakSelectionController, EvaluationController
 
 from bmicro.gui.mpl import MplCanvas
+from bmicro.gui.base_settings import has_analysis, reset_analysis
 
 
 import os
@@ -30,6 +31,9 @@ class DataView(QtWidgets.QWidget):
             uic.loadUi(ui_file, self)
 
         self.parent = args[0]
+        # True while update_ui() copies the session state into the
+        # controls - their change handlers must not ask anything then
+        self._syncing = False
 
         self.mplcanvas = MplCanvas(self.image_preview_widget)
         self.preview = self.mplcanvas.get_figure().add_subplot(111)
@@ -88,9 +92,19 @@ class DataView(QtWidgets.QWidget):
             self.label_calibration.setText(
                 str(not repetition.calibration.is_empty()))
 
-        if session.setup is not None:
-            self.combobox_setup.setCurrentText(session.setup.name)
+        self._syncing = True
+        try:
+            if session.setup is not None:
+                self.combobox_setup.setCurrentText(session.setup.name)
+            self._show_orientation()
+        finally:
+            self._syncing = False
 
+        self.update_preview()
+
+    def _show_orientation(self):
+        """ Shows the session's orientation in the controls. """
+        session = Session.get_instance()
         self.checkbox_reflect_vertically.setChecked(
             session.orientation.reflection['vertically'])
         self.checkbox_reflect_horizontally.setChecked(
@@ -103,7 +117,45 @@ class DataView(QtWidgets.QWidget):
         self.radio_rotation_90_ccw.setChecked(
             session.orientation.rotation % 4 == 3)
 
-        self.update_preview()
+    def _repetitions_with_analysis(self):
+        session = Session.get_instance()
+        if session.file is None:
+            return []
+        return [key for key in session.file.repetition_keys()
+                if has_analysis(session, key)]
+
+    def _confirm_base_change(self, what, first_reset):
+        """
+        Setup and orientation are the base of the analysis: changing
+        them makes what was built on them outdated, which is reset. If
+        there is anything analysed, asks for confirmation. Returns the
+        repetitions to reset ([] if none), or None if the user cancels.
+        """
+        keys = self._repetitions_with_analysis()
+        if not keys:
+            return []
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setWindowTitle(f'Change {what}?')
+        box.setText(
+            f'Changing the {what} makes the existing analysis of '
+            f'repetition(s) {", ".join(keys)} outdated. It is reset from '
+            f'{first_reset} on: everything built on it has to be done '
+            f'again.')
+        box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok
+                               | QtWidgets.QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        if box.exec() != QtWidgets.QMessageBox.StandardButton.Ok:
+            return None
+        return keys
+
+    def _reset_after_base_change(self, keys, from_extraction):
+        """ Resets the analysis of `keys` and updates all tabs. """
+        if not keys:
+            return
+        reset_analysis(Session.get_instance(), keys, from_extraction)
+        if hasattr(self.parent, 'update_ui'):
+            self.parent.update_ui()
 
     def reset_ui(self):
         """
@@ -188,11 +240,22 @@ class DataView(QtWidgets.QWidget):
         session = Session.get_instance()
 
         if radio_button == self.radio_rotation_none:
-            session.set_rotation(0)
+            rotation = 0
         elif radio_button == self.radio_rotation_90_cw:
-            session.set_rotation(1)
+            rotation = 1
         elif radio_button == self.radio_rotation_90_ccw:
-            session.set_rotation(3)
+            rotation = 3
+        else:
+            return
+
+        reset = []
+        if rotation != session.orientation.rotation % 4:
+            reset = self._confirm_base_change('orientation', 'extraction')
+            if reset is None:  # cancelled: back to the current rotation
+                self._show_orientation()
+                return
+        session.set_rotation(rotation)
+        self._reset_after_base_change(reset, True)
 
         self.update_preview()
 
@@ -203,10 +266,24 @@ class DataView(QtWidgets.QWidget):
 
         session = Session.get_instance()
         if checkbox == self.checkbox_reflect_vertically:
-            session.set_reflection(vertically=checkbox.isChecked())
+            axis = 'vertically'
         elif checkbox == self.checkbox_reflect_horizontally:
-            session.set_reflection(
-                horizontally=checkbox.isChecked())
+            axis = 'horizontally'
+        else:
+            return
+
+        reset = []
+        changed = checkbox.isChecked() != bool(
+            session.orientation.reflection[axis])
+        if changed and not self._syncing:
+            reset = self._confirm_base_change('orientation', 'extraction')
+            if reset is None:  # cancelled: back to the current state
+                checkbox.blockSignals(True)
+                checkbox.setChecked(not checkbox.isChecked())
+                checkbox.blockSignals(False)
+                return
+        session.set_reflection(**{axis: checkbox.isChecked()})
+        self._reset_after_base_change(reset, True)
 
         self.update_preview()
 
@@ -254,4 +331,14 @@ class DataView(QtWidgets.QWidget):
             if s.name == name:
                 setup = s
                 break
+        reset = []
+        if not self._syncing and session.setup is not None \
+                and getattr(setup, 'key', None) != session.setup.key:
+            reset = self._confirm_base_change('setup', 'calibration')
+            if reset is None:  # cancelled: back to the current setup
+                self.combobox_setup.blockSignals(True)
+                self.combobox_setup.setCurrentText(session.setup.name)
+                self.combobox_setup.blockSignals(False)
+                return
         session.set_setup(setup)
+        self._reset_after_base_change(reset, False)

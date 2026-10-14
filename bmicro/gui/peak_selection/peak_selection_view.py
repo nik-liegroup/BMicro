@@ -146,7 +146,7 @@ class PeakSelectionView(QtWidgets.QWidget):
         evc = EvaluationController()
 
         try:
-            image_keys = session.get_image_keys()
+            image_keys = session.get_image_keys(sort_by_time=True)
             if not image_keys:
                 self.label_spectrum_index.setText('Position 0 / 0')
                 self.button_prev_spectrum.setEnabled(False)

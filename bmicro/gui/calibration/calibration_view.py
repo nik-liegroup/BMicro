@@ -94,6 +94,7 @@ class CalibrationView(QtWidgets.QWidget):
 
     def update_ui(self):
         self.combobox_calibration.clear()
+        self.current_frame = 0
         session = Session.get_instance()
 
         if not session.file:
@@ -101,6 +102,9 @@ class CalibrationView(QtWidgets.QWidget):
 
         calib_keys = session.get_calib_keys(sort_by_time=True)
         self.combobox_calibration.addItems(calib_keys)
+        # The selection handler already ran when the first item was
+        # added, i.e. while the list still had a single entry.
+        self.checkFrameNavigationButtons()
         self.refresh_plot()
 
     def reset_ui(self):
@@ -111,35 +115,49 @@ class CalibrationView(QtWidgets.QWidget):
         self.plot.cla()
         self.mplcanvas.draw()
 
+    def _frame_count(self):
+        calib_key = self.combobox_calibration.currentText()
+        if not calib_key:
+            return 0
+        return Session.get_instance().get_calibration_image_count(calib_key)
+
     def prev_frame(self):
+        """
+        Steps back one frame; from the first frame of a calibration, to
+        the last frame of the previous calibration.
+        """
         if self.current_frame > 0:
             self.current_frame -= 1
             self.refresh_plot()
-            self.checkFrameNavigationButtons()
+        elif self.combobox_calibration.currentIndex() > 0:
+            self.combobox_calibration.setCurrentIndex(
+                self.combobox_calibration.currentIndex() - 1)
+            self.current_frame = max(self._frame_count() - 1, 0)
+            self.refresh_plot()
+        self.checkFrameNavigationButtons()
 
     def next_frame(self):
-        session = Session.get_instance()
-        calib_key = self.combobox_calibration.currentText()
-        frame_count = session.get_calibration_image_count(calib_key)
-        if self.current_frame < frame_count - 1:
+        """
+        Steps forward one frame; from the last frame of a calibration,
+        to the first frame of the next calibration.
+        """
+        if self.current_frame < self._frame_count() - 1:
             self.current_frame += 1
             self.refresh_plot()
-            self.checkFrameNavigationButtons()
+        elif self.combobox_calibration.currentIndex() \
+                < self.combobox_calibration.count() - 1:
+            self.combobox_calibration.setCurrentIndex(
+                self.combobox_calibration.currentIndex() + 1)
+        self.checkFrameNavigationButtons()
 
     def checkFrameNavigationButtons(self):
-        if self.current_frame > 0:
-            self.button_prev_frame.setEnabled(True)
-        else:
-            self.button_prev_frame.setEnabled(False)
-
-        session = Session.get_instance()
-        calib_key = self.combobox_calibration.currentText()
-        if calib_key:
-            frame_count = session.get_calibration_image_count(calib_key)
-            if self.current_frame < frame_count - 1:
-                self.button_next_frame.setEnabled(True)
-            else:
-                self.button_next_frame.setEnabled(False)
+        index = self.combobox_calibration.currentIndex()
+        self.button_prev_frame.setEnabled(
+            self.current_frame > 0 or index > 0)
+        self.button_next_frame.setEnabled(
+            index >= 0 and (
+                self.current_frame < self._frame_count() - 1
+                or index < self.combobox_calibration.count() - 1))
 
     def clear_calibration(self):
         cc = CalibrationController()
@@ -203,6 +221,7 @@ class CalibrationView(QtWidgets.QWidget):
         self.refresh_plot()
 
     def on_select_calibration(self):
+        self.current_frame = 0
         self.checkFrameNavigationButtons()
         self.refresh_plot()
 
