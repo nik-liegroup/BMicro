@@ -60,6 +60,13 @@
        </widget>
       </item>
       <item>
+       <widget class="QCheckBox" name="checkbox_export_overview_tiles">
+        <property name="text">
+         <string>Brightfield overview tiles (unstitched)</string>
+        </property>
+       </widget>
+      </item>
+      <item>
        <widget class="QCheckBox" name="checkbox_export_surface">
         <property name="text">
          <string>Surface scan metrics</string>

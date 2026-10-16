@@ -130,23 +130,31 @@ def pending_repetitions(step, include_done=False, forced=(), allowed=None):
 class BatchStepDialog(QtWidgets.QDialog):
     """
     Hosts one of the regular analysis views (extraction, calibration or
-    peak selection) for a single file of a batch run.
+    peak selection) for a file of a batch run - for the repetitions in
+    `repetition_keys`, which can be switched in the header. The batch
+    opens one dialog per repetition; `repetition_position` is then
+    (number, count) of this one among those of the file.
 
-    Closing the dialog - or clicking "Save and next file" - keeps the
-    work and moves the batch on; "Stop batch" additionally sets
-    `stop_requested` so the caller ends the run.
+    Closing the dialog - or clicking the "Save and next ..." button -
+    keeps the work and moves the batch on; "Stop batch" additionally
+    sets `stop_requested` so the caller ends the run.
     """
 
     def __init__(self, parent, step, file_path, position, total,
-                 repetition_keys):
+                 repetition_keys, repetition_position=None):
         super().__init__(
             parent,
             QtCore.Qt.WindowType.WindowTitleHint |
             QtCore.Qt.WindowType.WindowCloseButtonHint |
             QtCore.Qt.WindowType.WindowMaximizeButtonHint)
         self.stop_requested = False
-        self.setWindowTitle(
-            f'Batch {STEP_TITLES[step].lower()} - file {position}/{total}')
+        title = f'Batch {STEP_TITLES[step].lower()} - file {position}/{total}'
+        last = True
+        if repetition_position is not None:
+            number, count = repetition_position
+            title += f' - repetition {repetition_keys[0]} ({number}/{count})'
+            last = number >= count
+        self.setWindowTitle(title)
         self.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
         self.resize(1200, 800)
 
@@ -171,7 +179,8 @@ class BatchStepDialog(QtWidgets.QDialog):
         buttons.addStretch(1)
         button_stop = QtWidgets.QPushButton('Stop batch')
         button_stop.clicked.connect(self.on_stop)
-        button_next = QtWidgets.QPushButton('Save and next file')
+        button_next = QtWidgets.QPushButton(
+            'Save and next file' if last else 'Save and next repetition')
         button_next.setDefault(True)
         button_next.clicked.connect(self.accept)
         buttons.addWidget(button_stop)

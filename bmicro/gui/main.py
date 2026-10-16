@@ -34,6 +34,7 @@ from bmicro.prefetch import FilePrefetcher
 from .plot_export import export_calibration_plots, evaluated_repetitions
 from .base_settings import setup_signature, orientation_signature, \
     saved_base_signature, reset_analysis
+from . import batch_cache
 from .batch_step_dialog import BatchStepDialog, pending_repetitions, \
     step_done, DOWNSTREAM_STEPS, calibration_gaps, calibration_gaps_text, \
     STEP_EXTRACTION, STEP_CALIBRATION, STEP_PEAK_SELECTION
@@ -226,7 +227,7 @@ class BMicro(QtWidgets.QMainWindow):
             'orientation': {
                 'set': False,
                 'rotation': 0,
-                'reflection': {'vertically': False, 'horizontally': True},
+                'reflection': {'vertically': False, 'horizontally': False},
             },
             'extraction': {
                 'extract': False,
@@ -506,6 +507,12 @@ class BMicro(QtWidgets.QMainWindow):
         checkbox_overview.toggled.connect(
             self.on_export_overview_brightfield_checkbox)
 
+        checkbox_tiles = dialog.checkbox_export_overview_tiles
+        checkbox_tiles.setChecked(
+            self.export_config['overviewBrightfield']['exportTiles'])
+        checkbox_tiles.toggled.connect(
+            self.on_export_overview_tiles_checkbox)
+
         checkbox_surface = dialog.checkbox_export_surface
         checkbox_surface.setChecked(
             self.export_config['surface']['export'])
@@ -569,6 +576,9 @@ class BMicro(QtWidgets.QMainWindow):
 
     def on_export_overview_brightfield_checkbox(self, checked):
         self.export_config['overviewBrightfield']['export'] = checked
+
+    def on_export_overview_tiles_checkbox(self, checked):
+        self.export_config['overviewBrightfield']['exportTiles'] = checked
 
     def on_export_surface_checkbox(self, checked):
         self.export_config['surface']['export'] = checked
@@ -1487,6 +1497,8 @@ class BMicro(QtWidgets.QMainWindow):
             included.append('Combined fluorescence images')
         if self.export_config['overviewBrightfield']['export']:
             included.append('Brightfield overview images')
+        if self.export_config['overviewBrightfield']['exportTiles']:
+            included.append('unstitched overview tiles')
         if self.export_config['surface']['export']:
             included.append('Surface scan')
         self.batch_dialog.label_export_summary.setText(
@@ -1677,11 +1689,17 @@ class BMicro(QtWidgets.QMainWindow):
             if not self.batch_evaluation_running:
                 break
 
-        batch_files = list(self.batch_files.values())
+        # Files with nothing left to evaluate/export are not opened
+        todo = [file for file in self.batch_files.values()
+                if self._batch_file_needs_evaluation(file)]
+        todo_ids = {id(file): position for position, file in enumerate(todo)}
         for i, (file_hash, file) in enumerate(self.batch_files.items()):
             if not self.batch_evaluation_running:
                 break
-            self._prefetch_batch_files(batch_files, i - 1)
+            if id(file) not in todo_ids:
+                self.batch_dialog.progressBar.setValue(i + 1)
+                continue
+            self._prefetch_batch_files(todo, todo_ids[id(file)] - 1)
             try:
                 self.evaluate_batch_file(file)
             except BaseException as e:
@@ -1897,6 +1915,46 @@ class BMicro(QtWidgets.QMainWindow):
         file['status'] = 'failed' if export_failed else 'success'
         self.update_batch_file_table()
 
+    # progress ('none', 'extraction', ...) a repetition needs to have
+    # reached for a step to be done
+    STEP_PROGRESS = {STEP_EXTRACTION: 1, STEP_CALIBRATION: 2,
+                     STEP_PEAK_SELECTION: 3}
+
+    def _batch_file_needs_step(self, file, step):
+        """
+        Whether a manual step has anything to do in `file`, judged from
+        the batch table's progress alone, without opening the file. Only
+        a file whose ticked repetitions all have the step behind them
+        is skipped (it would only be opened to find that out); anything
+        uncertain (progress unknown, a repetition redone upstream in
+        this run, re-analysis) counts as needing it.
+        """
+        repetitions = file.get('repetitions')
+        if self.batch_reanalyse or not repetitions \
+                or self.batch_forced.get((str(file['path']), step)):
+            return True
+        needed = self.STEP_PROGRESS[step]
+        for key in self._selected_batch_repetitions(file):
+            progress = repetitions[key]['progress']
+            if progress not in self.PROGRESS_STEPS \
+                    or self.PROGRESS_STEPS.index(progress) < needed:
+                return True
+        return False
+
+    def _batch_file_needs_evaluation(self, file):
+        """
+        Whether evaluating/exporting `file` has anything to do, from the
+        batch table's progress alone (see _batch_file_needs_step()).
+        """
+        repetitions = file.get('repetitions')
+        if self.batch_reanalyse or not repetitions \
+                or self.batch_config['export']['export']:
+            return True
+        if not self.batch_config['evaluation']['evaluate']:
+            return False
+        return any(repetitions[key]['progress'] != 'evaluation'
+                   for key in self._selected_batch_repetitions(file))
+
     def _apply_batch_base_settings(self, file):
         """
         Sets the batch dialog's setup and orientation on the open file.
@@ -1964,7 +2022,10 @@ class BMicro(QtWidgets.QMainWindow):
         already complete are skipped.
         """
         session = Session.get_instance()
-        files = list(self.batch_files.values())
+        # Files that have nothing to do for this step are not even
+        # opened or loaded in the background
+        files = [file for file in self.batch_files.values()
+                 if self._batch_file_needs_step(file, step)]
 
         for position, file in enumerate(files, start=1):
             file['status'] = 'in-process'
@@ -1995,18 +2056,25 @@ class BMicro(QtWidgets.QMainWindow):
                             (str(file['path']), downstream),
                             set()).update(pending)
                     self._prefill_batch_step(step, pending, file, forced)
-                    dialog = BatchStepDialog(
-                        self, step, file['path'], position, len(files),
-                        pending)
-                    dialog.exec()
-                    stop = dialog.stop_requested
-                    # The dialog is parented to this window, so it (and
-                    # its views and figures) would otherwise pile up
-                    # with every file of the batch. deleteLater() is not
-                    # enough: inside this loop, which never returns to
-                    # the event loop it was called from, it would only
-                    # delete them once the whole batch is over.
-                    sip.delete(dialog)
+                    # One window per repetition, in order
+                    stop = False
+                    for number, rep_key in enumerate(pending, start=1):
+                        dialog = BatchStepDialog(
+                            self, step, file['path'], position, len(files),
+                            [rep_key], (number, len(pending)))
+                        dialog.exec()
+                        stop = dialog.stop_requested
+                        # The dialog is parented to this window, so it
+                        # (and its views and figures) would otherwise
+                        # pile up with every repetition of the batch.
+                        # deleteLater() is not enough: inside this loop,
+                        # which never returns to the event loop it was
+                        # called from, it would only delete them once
+                        # the whole batch is over.
+                        sip.delete(dialog)
+                        if stop:
+                            break
+                    # Saved once per file, after its last repetition
                     self.save_session()
                     self._refresh_file_progress(file)
                     if stop:
@@ -2165,12 +2233,33 @@ class BMicro(QtWidgets.QMainWindow):
         {key: {'label', 'valid', 'checked'}}. A repetition without
         grid data (an aborted/restarted acquisition that never wrote
         any positions or spectra) is not valid and can't be ticked.
-        Of the valid ones only the one with the most spectra starts
-        ticked. The label shows the total measurement time to tell restarts
-        apart.
+        All valid ones start ticked (the others can be unticked by
+        hand). The label shows the total measurement time to tell
+        restarts apart.
         Returns an empty dict if the file can't be scanned, which
         means "all repetitions".
+
+        Reading the raw file and the saved session takes seconds, so
+        both are looked up in the file's batch_cache entry first, which
+        is only used while they are unchanged.
         """
+        cached = batch_cache.read(path, get_session_file_path(path))
+        if cached is not None and cached['repetitions'] is not None:
+            repetitions = {
+                key: dict(info, checked=False, progress=None)
+                for key, info in cached['repetitions'].items()}
+        else:
+            repetitions = BMicro._read_batch_repetitions(path)
+        # By default every repetition that has data is analysed; one
+        # that should be left out can be unticked in the table.
+        for rep in repetitions.values():
+            rep['checked'] = rep['valid']
+        BMicro._refresh_batch_progress(path, repetitions, cached=cached)
+        return repetitions
+
+    @staticmethod
+    def _read_batch_repetitions(path):
+        """ The repetitions of the raw file, see _scan_batch_repetitions(). """
         repetitions = {}
         try:
             file = BrillouinFile(path)
@@ -2211,35 +2300,39 @@ class BMicro(QtWidgets.QMainWindow):
                     'nr_spectra': nr_spectra}
         finally:
             file.close()
-        # By default only the repetition with the most measurement
-        # points is analysed (the latest one if several are equal); the
-        # others can be ticked by hand.
-        valid_keys = [key for key, rep in repetitions.items()
-                      if rep['valid']]
-        if valid_keys:
-            best = max(reversed(valid_keys),
-                       key=lambda key: repetitions[key]['nr_spectra'])
-            repetitions[best]['checked'] = True
-        BMicro._refresh_batch_progress(path, repetitions)
         return repetitions
 
     @staticmethod
-    def _refresh_batch_progress(path, repetitions):
+    def _refresh_batch_progress(path, repetitions, models=None,
+                                cached=None):
         """
         Sets rep['progress'] for every repetition to the last analysis
         step completed so far ('none', 'extraction', 'calibration',
-        'peak selection' or 'evaluation'), read from the saved session
-        file without touching the open session. Each step counts only
-        if all earlier ones are done too.
+        'peak selection' or 'evaluation'). Each step counts only if all
+        earlier ones are done too.
+
+        Where it comes from, fastest first: the batch_cache entry
+        `cached` (still valid), the `models` given (the open session,
+        just saved), the saved session file (which has to be
+        deserialised completely). The result is stored in the file's
+        batch_cache entry for the next look.
         """
         session_path = get_session_file_path(path)
-        models = None
+        if models is None and cached is not None \
+                and cached['progress'] is not None \
+                and set(cached['progress']) == set(repetitions):
+            for key, rep in repetitions.items():
+                rep.update(cached['progress'][key])
+                rep['saved_base'] = cached['saved_base']
+            return
+        read_ok = True
         try:
-            if os.path.exists(session_path) \
+            if models is None and os.path.exists(session_path) \
                     and is_session_file(session_path):
                 with h5py.File(session_path, 'r') as f:
                     models = Serializer.deserialize(f['session'])
         except Exception:
+            read_ok = False
             logger.warning(
                 'Could not read progress from %s', session_path,
                 exc_info=True)
@@ -2288,6 +2381,8 @@ class BMicro(QtWidgets.QMainWindow):
             except Exception:
                 progress = 'unknown'
             rep['progress'] = progress
+        if read_ok:
+            batch_cache.write(path, session_path, repetitions, saved_base)
 
     PROGRESS_STEPS = ['none', 'extraction', 'calibration',
                       'peak selection', 'evaluation']
@@ -2320,8 +2415,19 @@ class BMicro(QtWidgets.QMainWindow):
         return text
 
     def _refresh_file_progress(self, file):
+        """
+        Updates the batch table's progress of a file after it was saved.
+        The open session is that file's, just saved, so it is used
+        directly instead of reading the saved session again.
+        """
+        session = Session.get_instance()
+        models = None
+        if session.file is not None and pathlib.Path(
+                session.file.path).resolve() == pathlib.Path(
+                file['path']).resolve():
+            models = session
         self._refresh_batch_progress(
-            file['path'], file.get('repetitions', {}))
+            file['path'], file.get('repetitions', {}), models=models)
 
     @staticmethod
     def _selected_batch_repetitions(file):
@@ -2455,6 +2561,43 @@ def excepthook(etype, value, trace):
     tmp = traceback.format_exception(etype, value, trace)
     exception = "".join([vinfo]+tmp)
 
+    app = QtCore.QCoreApplication.instance()
+    if app is not None and QtCore.QThread.currentThread() is not app.thread():
+        # Raised in a background thread (e.g. a calibration running in a
+        # BGThread). Qt cannot show a window from here, and blocking in
+        # one would leave whoever waits for this thread (the GUI thread,
+        # in thread.wait()) waiting forever - the whole app would hang
+        # without any message. So log it, return, and let the GUI thread
+        # show the dialog once it is back in its event loop.
+        logger.error('Unhandled exception in a background thread:\n%s',
+                     exception)
+        error_presenter.show.emit(exception)
+        return
+    show_error_box(exception)
+
+
+class ErrorPresenter(QtCore.QObject):
+    """
+    Shows error dialogs in the GUI thread for exceptions raised in other
+    threads: a signal emitted from there is delivered to this object
+    (which lives in the thread that created it, the main thread) when
+    that thread is back in its event loop.
+    """
+    show = QtCore.pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.show.connect(self._show)
+
+    @staticmethod
+    def _show(text):
+        show_error_box(text)
+
+
+error_presenter = ErrorPresenter()
+
+
+def show_error_box(exception):
     errorbox = QtWidgets.QMessageBox()
     errorbox.addButton(QtWidgets.QPushButton('Close'),
                        QtWidgets.QMessageBox.ButtonRole.YesRole)

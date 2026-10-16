@@ -240,8 +240,12 @@ class CalibrationView(QtWidgets.QWidget):
         self.thread.set_task(
             func=self.calibration_controller.calibrate, fkw=dnkw)
         self.thread.start()
-        # Show a progress until computation is done
-        while max_count.value == 0 or count.value < max_count.value:
+        # Show a progress until the computation is done. Waiting for the
+        # thread, not for the counter to reach its maximum: the counter
+        # stays short when the calibration ends early (nothing to
+        # calibrate, a frame that cannot be fitted, an error in the
+        # thread), and waiting for it then never ends.
+        while self.thread.isRunning():
             time.sleep(.05)
             self.calibration_progress.setValue(count.value)
             if max_count.value >= 0:

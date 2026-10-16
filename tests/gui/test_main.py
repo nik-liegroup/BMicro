@@ -557,3 +557,89 @@ def test_data_tab_does_not_ask_without_analysis_or_when_refreshing(
     view.update_ui()  # copies the state into the controls
     ask.assert_not_called()
     assert view.checkbox_reflect_vertically.isChecked()
+
+
+def _run_manual_step(window, mocker, stop_in=None):
+    """ Runs the extraction step over a file with two repetitions to do. """
+    from bmicro.gui import main as main_module
+    session = _open_water_in_session()
+    key, file = _file_entry(session, 'none')
+    file['repetitions']['1'] = dict(file['repetitions'][key])
+    window.batch_files = {'x': file}
+    window.batch_evaluation_running = True
+    for name in ('open_file', '_prefill_batch_step', 'save_session',
+                 '_refresh_file_progress', 'close_file',
+                 'update_batch_file_table', '_prefetch_batch_files'):
+        mocker.patch.object(window, name)
+    mocker.patch.object(main_module, 'pending_repetitions',
+                        return_value=['0', '1'])
+    mocker.patch.object(main_module.sip, 'delete')
+    opened = []
+
+    class FakeDialog:
+        def __init__(self, *args):
+            self.args = args
+            self.stop_requested = False
+            opened.append(self)
+
+        def exec(self):
+            self.stop_requested = stop_in == len(opened)
+
+    mocker.patch.object(main_module, 'BatchStepDialog', FakeDialog)
+    window.run_batch_interactive_step('extraction')
+    return opened
+
+
+def test_manual_steps_open_one_window_per_repetition(window, mocker):
+    opened = _run_manual_step(window, mocker)
+
+    assert [d.args[5] for d in opened] == [['0'], ['1']]  # one rep each
+    assert [d.args[6] for d in opened] == [(1, 2), (2, 2)]
+    window.save_session.assert_called_once()  # saved once, for the file
+
+
+def test_stopping_in_a_repetition_window_ends_the_batch(window, mocker):
+    opened = _run_manual_step(window, mocker, stop_in=1)
+
+    assert len(opened) == 1  # the second repetition is not opened
+    window.save_session.assert_called_once()  # but the work is saved
+    assert not window.batch_evaluation_running
+
+
+def test_error_in_a_background_thread_does_not_block_that_thread(
+        qtbot, mocker):
+    """
+    A dialog opened from a worker thread never shows and blocks it for
+    good - and the GUI thread, waiting for the worker, with it.
+    """
+    import threading
+    from bmicro.gui import main as main_module
+    shown = []
+    mocker.patch.object(main_module, 'show_error_box', shown.append)
+
+    def fail():
+        try:
+            raise ValueError('boom')
+        except ValueError:
+            main_module.excepthook(*__import__('sys').exc_info())
+
+    worker = threading.Thread(target=fail)
+    worker.start()
+    worker.join(timeout=10)
+
+    assert not worker.is_alive()  # it returned instead of waiting
+    assert shown == []  # nothing was opened from that thread
+    qtbot.waitUntil(lambda: len(shown) == 1, timeout=5000)  # GUI thread
+    assert 'boom' in shown[0]
+
+
+def test_error_in_the_gui_thread_is_shown_at_once(qtbot, mocker):
+    import sys
+    from bmicro.gui import main as main_module
+    shown = []
+    mocker.patch.object(main_module, 'show_error_box', shown.append)
+    try:
+        raise ValueError('here')
+    except ValueError:
+        main_module.excepthook(*sys.exc_info())
+    assert len(shown) == 1 and 'here' in shown[0]
