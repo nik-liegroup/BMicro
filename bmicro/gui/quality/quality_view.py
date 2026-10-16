@@ -567,8 +567,8 @@ class QualityView(QtWidgets.QWidget):
         # Center x and y around zero (relative sample coordinates), as
         # the Evaluation tab does; z is left as the actual acquired
         # stage position.
-        for position in positions[:2]:
-            position -= np.nanmean(position)
+        positions[:2] = [position - np.nanmean(position)
+                         for position in positions[:2]]
 
         dslice = [slice(None) if dim > 1 else 0 for dim in data.shape]
         idx = [i for i, dim in enumerate(data.shape) if dim > 1]

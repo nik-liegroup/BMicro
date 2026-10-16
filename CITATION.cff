@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "BMicro"
+abstract: >-
+  Graphical application for the evaluation of Brillouin microscopy data; this version adds batch evaluation
+  with a progress cache, acquisition information, plot export and the Stokes/anti-Stokes shift.
+authors:
+  - family-names: Gampl
+    given-names: Niklas
+  - name: "BMicro developers"
+version: 0.14.0
+license: GPL-3.0-only
+repository-code: "https://github.com/nik-liegroup/BMicro"
+keywords:
+  - Brillouin microscopy
+  - data evaluation
+references:
+  - type: software
+    title: "BMicro"
+    authors:
+      - name: "BMicro developers"
+    repository-code: "https://github.com/BrillouinMicroscopy/BMicro"
+    license: GPL-3.0-only

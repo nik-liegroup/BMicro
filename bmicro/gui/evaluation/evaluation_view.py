@@ -152,9 +152,6 @@ class EvaluationView(QtWidgets.QWidget):
         self.nrBrillouinPeaks_4.toggled.connect(
             lambda: self.setNrBrillouinPeaks(4))
 
-        self.checkbox_evaluate_sum.clicked.connect(
-            self.on_evaluation_mode_changed)
-
     def update_ui(self):
         session = Session.get_instance()
         evm = session.evaluation_model()
@@ -181,12 +178,6 @@ class EvaluationView(QtWidgets.QWidget):
         elif evm.nr_brillouin_peaks == 4:
             self.nrBrillouinPeaks_4.setChecked(True)
             self.bounds_table.setEnabled(True)
-
-        # checkbox_evaluate_sum.clicked (unlike .toggled) is only
-        # emitted by genuine user interaction, not by setChecked()
-        # here, so this can't re-trigger on_evaluation_mode_changed()'s
-        # own status-bar message on every tab refresh.
-        self.checkbox_evaluate_sum.setChecked(evm.evaluation_mode == 'sum')
 
         self.updateBoundsTable()
         self.setup_parameter_selection_combobox()
@@ -251,8 +242,8 @@ class EvaluationView(QtWidgets.QWidget):
         # relative sample coordinates), but z is left as the actual
         # acquired stage position.
         positions = list(self.session.get_payload_positions().values())
-        for position in positions[:2]:
-            position -= np.nanmean(position)
+        positions[:2] = [position - np.nanmean(position)
+                         for position in positions[:2]]
 
         idx = self._click_context['idx']
         dslice = self._click_context['dslice']
@@ -334,13 +325,22 @@ class EvaluationView(QtWidgets.QWidget):
             combobox.addItem('Combined (sum of repeats)', 'combined')
             for frame_num in range(nr_images):
                 combobox.addItem(f'Repeat {frame_num + 1}', frame_num)
-            # Default to the combined view in 'sum' mode (it's what's
-            # actually reported), otherwise to the first repeat.
-            if evm is not None and evm.evaluation_mode == 'sum':
-                combobox.setCurrentIndex(0)
-            else:
-                combobox.setCurrentIndex(1)
+            # Default to the combined view where the point is reported
+            # from its summed spectra (adaptive frame extension, see
+            # EvaluationController.summed_points()), otherwise to the
+            # first repeat.
+            combobox.setCurrentIndex(
+                0 if self._point_is_summed(image_key) else 1)
         combobox.blockSignals(False)
+
+    def _point_is_summed(self, image_key):
+        summed = self.evaluation_controller.summed_points()
+        if summed is None:
+            return False
+        resolution = Session.get_instance().get_payload_resolution()
+        indices = self.evaluation_controller.get_indices_from_key(
+            resolution, image_key)
+        return bool(summed[indices])
 
     def on_spectrum_selection_changed(self):
         if self.isd_current_image_key is None:
@@ -355,14 +355,14 @@ class EvaluationView(QtWidgets.QWidget):
         single frame repeat's own raw spectrum and its own
         individually-fitted peaks (unchanged from before this
         repeat-selector existed), or - only offered once there is more
-        than one repeat - the actual summed-and-fit-once spectrum used
-        for this point's reported value in 'sum' evaluation_mode (see
-        EvaluationController.get_combined_spectrum()/get_fits_combined()).
-        The combined spectrum trace is always shown when selected
-        (computed live from the cached per-frame spectra, independent
-        of the model's *current* evaluation_mode), but its fit overlay
-        only appears if this point was actually evaluated while in
-        'sum' mode - otherwise the fit arrays are still NaN.
+        than one repeat - the summed-and-fit-once spectrum, which is
+        what a point with adaptively extended frames is reported from
+        (see EvaluationController.get_combined_spectrum()/
+        get_fits_combined()/summed_points()). The combined spectrum
+        trace is always shown when selected (computed live from the
+        cached per-frame spectra), but its fit overlay only appears for
+        a point that was fit that way - otherwise the fit arrays are
+        NaN.
         """
         self.isd_spectrum_plot.cla()
         self.isd_spectrum_plot.set_xlabel('$f$ [GHz]')
@@ -414,8 +414,8 @@ class EvaluationView(QtWidgets.QWidget):
 
         if brillouin_fits is None or rayleigh_fits is None \
                 or np.all(np.isnan(brillouin_fits[0][image_nr])):
-            # No fit to overlay - e.g. the combined view before this
-            # point was ever evaluated in 'sum' mode.
+            # No fit to overlay - e.g. the combined view of a point
+            # that was fit frame by frame (no adaptive frame extension).
             self.isd_spectrum_canvas.draw()
             return
 
@@ -554,38 +554,6 @@ class EvaluationView(QtWidgets.QWidget):
 
         self.updateBoundsTable()
 
-    def on_evaluation_mode_changed(self):
-        """
-        Wired to checkbox_evaluate_sum.clicked (see __init__) - a user-
-        driven toggle of EvaluationModel.evaluation_mode ('sum' vs.
-        'single', see that model for what each means).
-
-        Toggling this does NOT retroactively fill/clear the '_combined'
-        backing arrays for already-evaluated points - those are only
-        (re-)written by evaluate() actually running in the new mode
-        (see EvaluationController.evaluate()). Until Evaluate is
-        re-run, get_data() would otherwise silently start reading
-        all-NaN '_combined' arrays in 'sum' mode. This tab has no
-        existing lighter-weight "results are now stale" indicator for
-        a fit-setting change (changing nr_brillouin_peaks/the bounds
-        table has the same gap - re-evaluating is left entirely to the
-        user there too), so this surfaces the same way BMicro already
-        reports transient status elsewhere (see MainWindow.
-        export_file()'s statusbar.showMessage() calls) rather than
-        failing silently.
-        """
-        session = Session.get_instance()
-        evm = session.evaluation_model()
-        if evm is None:
-            return
-        evm.evaluation_mode = \
-            'sum' if self.checkbox_evaluate_sum.isChecked() else 'single'
-        main_window = self.window()
-        if hasattr(main_window, 'statusbar'):
-            main_window.statusbar.showMessage(
-                'Frame-repeat handling changed - click "Evaluate" to '
-                'apply it to the current results.', 8000)
-
     def boundsChanged(self, row, column):
         session = Session.get_instance()
         evm = session.evaluation_model()
@@ -706,7 +674,6 @@ class EvaluationView(QtWidgets.QWidget):
             self._quality_view._fail_markers = []
         self.updateBoundsTable()
         self.nrBrillouinPeaks_1.setChecked(True)
-        self.checkbox_evaluate_sum.setChecked(False)
         # Blocked for the same reason as combobox_peak_number just
         # below: unblocked, clear() changes the current index and fires
         # currentIndexChanged -> on_select_parameter -> refresh_plot(),
@@ -881,13 +848,18 @@ class EvaluationView(QtWidgets.QWidget):
         self.evaluation_running = True
         self.button_evaluate.setText('Cancel')
         # While the evaluation is running, we
-        # disable switching to multi-peak fit and adjusting bounds,
-        # and changing frame-repeat handling (a fresh evaluate() run
-        # is what applies it - toggling it mid-run would be confusing).
+        # disable switching to multi-peak fit and adjusting bounds
         self.nrBrillouinPeaksGroup.setEnabled(False)
         self.bounds_table.setEnabled(False)
-        self.evaluationModeGroup.setEnabled(False)
         self.evaluation_timer.start(500)
+
+        # Frame repeats are always handled the same way, also for a
+        # session saved with another setting: static frames fit
+        # separately, adaptively extended points from their summed
+        # spectra (see EvaluationModel.evaluation_mode).
+        evm = self.session.evaluation_model()
+        if evm is not None:
+            evm.evaluation_mode = 'auto'
 
         self.plot_count = 0
         self.count = mp.Value('I', 0, lock=True)
@@ -951,7 +923,6 @@ class EvaluationView(QtWidgets.QWidget):
             self.evaluation_running = False
             self.button_evaluate.setText('Evaluate')
             self.nrBrillouinPeaksGroup.setEnabled(True)
-            self.evaluationModeGroup.setEnabled(True)
             session = Session.get_instance()
             if session.evaluation_model().nr_brillouin_peaks > 1:
                 self.bounds_table.setEnabled(True)
@@ -1036,8 +1007,8 @@ class EvaluationView(QtWidgets.QWidget):
 
         # Center x and y around zero (relative sample coordinates);
         # z is left as the actual acquired stage position.
-        for position in positions[:2]:
-            position -= np.nanmean(position)
+        positions[:2] = [position - np.nanmean(position)
+                         for position in positions[:2]]
 
         self.button_toggle_3d.setVisible(bool(dimensionality == 3))
         self.checkbox_transparent_blocks.setVisible(
