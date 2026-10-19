@@ -251,8 +251,8 @@ class EvaluationView(QtWidgets.QWidget):
         # relative sample coordinates), but z is left as the actual
         # acquired stage position.
         positions = list(self.session.get_payload_positions().values())
-        for position in positions[:2]:
-            position -= np.nanmean(position)
+        positions[:2] = [position - np.nanmean(position)
+                         for position in positions[:2]]
 
         idx = self._click_context['idx']
         dslice = self._click_context['dslice']
@@ -1036,8 +1036,8 @@ class EvaluationView(QtWidgets.QWidget):
 
         # Center x and y around zero (relative sample coordinates);
         # z is left as the actual acquired stage position.
-        for position in positions[:2]:
-            position -= np.nanmean(position)
+        positions[:2] = [position - np.nanmean(position)
+                         for position in positions[:2]]
 
         self.button_toggle_3d.setVisible(bool(dimensionality == 3))
         self.checkbox_transparent_blocks.setVisible(

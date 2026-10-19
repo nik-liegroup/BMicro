@@ -156,7 +156,8 @@ def _state(**config):
     state = types.SimpleNamespace(
         batch_reanalyse=False, batch_forced={},
         batch_config={'export': {'export': False},
-                      'evaluation': {'evaluate': True}},
+                      'evaluation': {'evaluate': True},
+                      'quality_apply': {'apply': False}},
         PROGRESS_STEPS=BMicro.PROGRESS_STEPS,
         STEP_PROGRESS=BMicro.STEP_PROGRESS,
         _selected_batch_repetitions=BMicro._selected_batch_repetitions)
@@ -205,6 +206,12 @@ def test_files_without_anything_left_to_evaluate_are_not_opened():
     nothing = _state()
     nothing.batch_config['evaluation']['evaluate'] = False
     assert not needs(nothing, _file('none'))
+
+    quality = _state()  # quality thresholds alone need the evaluated results only
+    quality.batch_config['evaluation']['evaluate'] = False
+    quality.batch_config['quality_apply']['apply'] = True
+    assert needs(quality, _file('evaluation'))
+    assert not needs(quality, _file('peak selection'))
 
 
 def test_every_repetition_with_data_is_ticked_by_default(tmp_path):

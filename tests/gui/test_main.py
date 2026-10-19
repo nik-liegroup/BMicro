@@ -643,3 +643,47 @@ def test_error_in_the_gui_thread_is_shown_at_once(qtbot, mocker):
     except ValueError:
         main_module.excepthook(*sys.exc_info())
     assert len(shown) == 1 and 'here' in shown[0]
+
+
+def test_batch_quality_is_applied_without_evaluating(window, mocker):
+    import numpy as np
+    session = _open_window_session_evaluated()
+    key, file = _file_entry(session, 'evaluation')
+    window.batch_config['evaluation']['evaluate'] = False
+    window.batch_config['quality_apply']['apply'] = True
+    window.batch_config['quality']['brillouin_peak_snr'] = {
+        'enabled': True, 'min': 7.0, 'max': None}
+    apply = mocker.patch(
+        'bmicro.gui.main.EvaluationController.apply_quality_thresholds')
+    evaluate = mocker.patch.object(window, '_batch_evaluate_repetition')
+
+    assert window._batch_file_needs_evaluation(file)  # opened for the QC alone
+    window._batch_apply_quality(file, key)
+
+    apply.assert_called_once()
+    evaluate.assert_not_called()
+    thresholds = session.evaluation_model().quality_thresholds
+    assert thresholds['brillouin_peak_snr']['min'] == 7.0
+    assert window.batch_evaluation_messages == []
+
+
+def test_batch_quality_not_applied_to_an_unevaluated_repetition(window, mocker):
+    session = _open_water_in_session()
+    key, file = _file_entry(session, 'peak-selection')
+    window.batch_config['quality_apply']['apply'] = True
+    apply = mocker.patch(
+        'bmicro.gui.main.EvaluationController.apply_quality_thresholds')
+
+    assert not window._batch_file_needs_evaluation(file)
+    window._batch_apply_quality(file, key)
+
+    apply.assert_not_called()
+    assert 'not evaluated' in window.batch_evaluation_messages[0]
+
+
+def _open_window_session_evaluated():
+    import numpy as np
+    session = _open_water_in_session()
+    evm = session.evaluation_model()
+    evm.results['time'] = np.ones((1, 1, 1, 1, 1, 1))
+    return session

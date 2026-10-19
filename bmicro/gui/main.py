@@ -247,19 +247,17 @@ class BMicro(QtWidgets.QMainWindow):
                 'bounds_w0': None,
                 'bounds_fwhm': None,
             },
-            # Applied to every file right after it's evaluated (see
-            # evaluate_batch_file()) - same thresholds/metrics as the
+            # Thresholds for the "Quality" section of the batch dialog
+            # (see _build_batch_quality_rows()): same metrics as the
             # Quality tab (EvaluationController.QUALITY_METRIC_KEYS),
             # prefilled with EvaluationModel.get_default_quality_
-            # thresholds() and editable in the "Quality" section of
-            # the batch dialog (see _build_batch_quality_rows()).
-            # Unlike the other sections here, this isn't optional/
-            # gated by its own checkbox: whatever is set here always
-            # replaces each file's own saved thresholds and is applied
-            # (evc.apply_quality_thresholds(), writing quality_pass)
-            # whenever "Evaluate" is ticked.
+            # thresholds(). Ticking the section applies them to the
+            # saved results of every selected repetition, replacing the
+            # file's own thresholds (see _batch_apply_quality()) - with
+            # or without "Evaluate".
             'quality': copy.deepcopy(
                 EvaluationModel.get_default_quality_thresholds()),
+            'quality_apply': {'apply': False},
             'export': {
                 'export': False,
             },
@@ -1122,8 +1120,13 @@ class BMicro(QtWidgets.QMainWindow):
             .clicked.connect(self.on_evaluation_evaluate)
         self.batch_dialog.nrBrillouinPeaksGroup\
             .setEnabled(cfg_evaluation['evaluate'])
-        self.batch_dialog.group_5b_quality\
-            .setEnabled(cfg_evaluation['evaluate'])
+        self.batch_dialog.group_5b_quality.setCheckable(True)
+        self.batch_dialog.group_5b_quality.setTitle(
+            'Quality - apply thresholds to saved results (no re-fit)')
+        self.batch_dialog.group_5b_quality.setChecked(
+            self.batch_config['quality_apply']['apply'])
+        self.batch_dialog.group_5b_quality.toggled.connect(
+            self.on_quality_apply)
         if cfg_evaluation['nr_brillouin_peaks'] == 1:
             self.batch_dialog.nrBrillouinPeaks_1.setChecked(True)
         elif cfg_evaluation['nr_brillouin_peaks'] == 2:
@@ -1428,6 +1431,9 @@ class BMicro(QtWidgets.QMainWindow):
         current_region = tuple(current_region)
         region_table[row] = current_region
 
+    def on_quality_apply(self, checked):
+        self.batch_config['quality_apply']['apply'] = checked
+
     def on_evaluation_evaluate(self):
         self._set_batch_evaluate(self.sender().isChecked())
 
@@ -1435,8 +1441,6 @@ class BMicro(QtWidgets.QMainWindow):
         self.batch_config['evaluation']['evaluate'] = evaluate
         self.batch_dialog.checkBox_evaluation.setChecked(evaluate)
         self.batch_dialog.nrBrillouinPeaksGroup\
-            .setEnabled(self.batch_config['evaluation']['evaluate'])
-        self.batch_dialog.group_5b_quality\
             .setEnabled(self.batch_config['evaluation']['evaluate'])
         self.batch_dialog.bounds_table\
             .setEnabled(
@@ -1764,97 +1768,14 @@ class BMicro(QtWidgets.QMainWindow):
             # run_batch_interactive_step()).
 
             # Evaluation
-            cfg_evaluation = self.batch_config['evaluation']
-            if cfg_evaluation['evaluate']:
-                # A repetition that is evaluated already keeps its
-                # results unless 'Re-analyse finished files' is ticked.
-                # (Upstream steps redone in this run bring the
-                # repetition's progress below 'evaluation' again.)
-                progress = (file.get('repetitions') or {}).get(
-                    rep_key, {}).get('progress')
-                if progress == 'evaluation' and not self.batch_reanalyse:
-                    continue
-                self.tabWidget.setCurrentIndex(4)
-                if self.aborted(file):
-                    return
-                QtCore.QCoreApplication.instance().processEvents()
+            if self.batch_config['evaluation']['evaluate'] \
+                    and self._batch_evaluate_repetition(file, rep_key):
+                return  # aborted
 
-                # A repetition with no valid measurement grid at all
-                # (an aborted/restarted acquisition that never wrote
-                # any positions) has nothing to evaluate - skip it
-                # quietly, same as the rest of the pipeline already
-                # does for it elsewhere (e.g. BrillouinExport.export()).
-                if session.get_payload_resolution() is None:
-                    continue
-
-                # If "Select peaks"/"Calibrate" aren't ticked for this
-                # batch run, evaluation relies entirely on whatever was
-                # already saved for this file (see set_file()/load() -
-                # loaded before this loop, in open_file() above). A
-                # repetition with neither would otherwise fit silently
-                # against undefined regions/calibration - skip just
-                # this repetition instead (a multi-repetition file can
-                # easily have one aborted/never-finished repetition
-                # alongside perfectly good ones, so one bad repetition
-                # must not stop the rest of the file from being
-                # evaluated/exported), and record why so it shows up
-                # in the summary run_batch_evaluation() shows at the
-                # end rather than silently producing an empty result.
-                pm = session.peak_selection_model()
-                cm = session.calibration_model()
-                missing = []
-                if not pm.get_brillouin_regions() \
-                        or not pm.get_rayleigh_regions():
-                    missing.append(
-                        "no Brillouin/Rayleigh peak regions selected")
-                if cm.frequencies_by_time_interpolator is None:
-                    missing.append("no valid calibration")
-                if missing:
-                    self.batch_evaluation_messages.append(
-                        f"{file['path']} repetition {rep_key}: "
-                        f"skipped evaluation - {'; '.join(missing)}.")
-                    continue
-
-                # Still evaluated, but flagged: the missing calibrations
-                # are interpolated over from the remaining ones.
-                gaps = calibration_gaps_text(*calibration_gaps(
-                    session.get_calib_keys() or [],
-                    session.extraction_model(), cm))
-                if gaps:
-                    self.batch_evaluation_messages.append(
-                        f"{file['path']} repetition {rep_key}: "
-                        f"evaluated with incomplete calibrations "
-                        f"({gaps}).")
-
-                evc = EvaluationController()
-                evc.set_nr_brillouin_peaks(
-                    cfg_evaluation['nr_brillouin_peaks'])
-                evc.set_bounds(cfg_evaluation['bounds_w0'])
-                evc.set_bounds_fwhm(cfg_evaluation['bounds_fwhm'])
-                self.widget_evaluation_view.evaluate(
-                    blocking=True, notify_blocked=False)
-                # start_batch_evaluation() already refuses to start a
-                # batch while an export is running, but if one somehow
-                # got started anyway (or started on another instance),
-                # evaluate() above silently declined to run at all -
-                # applying/exporting this repetition's (stale, possibly
-                # entirely absent) results would be worse than just
-                # flagging it as skipped.
-                if getattr(self, 'export_running', False):
-                    self.batch_evaluation_messages.append(
-                        f"{file['path']} repetition {rep_key}: "
-                        f"skipped evaluation - an export was running.")
-                    continue
-                # The "Quality" section's thresholds (see
-                # _build_batch_quality_rows()) apply to every file in
-                # the batch, replacing whatever that file had saved -
-                # then write evm.results['quality_pass'] from them,
-                # same as clicking "Apply to results" on the Quality
-                # tab, so it's exported/saved without a manual step
-                # per file.
-                session.evaluation_model().quality_thresholds = \
-                    copy.deepcopy(self.batch_config['quality'])
-                evc.apply_quality_thresholds()
+            # Quality: independent of the evaluation - applies the
+            # thresholds to the saved results, nothing is fitted
+            if self.batch_config['quality_apply']['apply']:
+                self._batch_apply_quality(file, rep_key)
 
         # Export - once per file, after every repetition has been
         # evaluated, not once per repetition inside the loop above:
@@ -1915,6 +1836,112 @@ class BMicro(QtWidgets.QMainWindow):
         file['status'] = 'failed' if export_failed else 'success'
         self.update_batch_file_table()
 
+    def _batch_evaluate_repetition(self, file, rep_key):
+        """
+        Evaluates the current repetition of the open batch file. Returns
+        True if the batch was aborted meanwhile.
+        """
+        session = Session.get_instance()
+        cfg_evaluation = self.batch_config['evaluation']
+        # A repetition that is evaluated already keeps its
+        # results unless 'Re-analyse finished files' is ticked.
+        # (Upstream steps redone in this run bring the
+        # repetition's progress below 'evaluation' again.)
+        progress = (file.get('repetitions') or {}).get(
+            rep_key, {}).get('progress')
+        if progress == 'evaluation' and not self.batch_reanalyse:
+            return False
+        self.tabWidget.setCurrentIndex(4)
+        if self.aborted(file):
+            return True
+        QtCore.QCoreApplication.instance().processEvents()
+
+        # A repetition with no valid measurement grid at all
+        # (an aborted/restarted acquisition that never wrote
+        # any positions) has nothing to evaluate - skip it
+        # quietly, same as the rest of the pipeline already
+        # does for it elsewhere (e.g. BrillouinExport.export()).
+        if session.get_payload_resolution() is None:
+            return False
+
+        # If "Select peaks"/"Calibrate" aren't ticked for this
+        # batch run, evaluation relies entirely on whatever was
+        # already saved for this file (see set_file()/load() -
+        # loaded before this loop, in open_file() above). A
+        # repetition with neither would otherwise fit silently
+        # against undefined regions/calibration - skip just
+        # this repetition instead (a multi-repetition file can
+        # easily have one aborted/never-finished repetition
+        # alongside perfectly good ones, so one bad repetition
+        # must not stop the rest of the file from being
+        # evaluated/exported), and record why so it shows up
+        # in the summary run_batch_evaluation() shows at the
+        # end rather than silently producing an empty result.
+        pm = session.peak_selection_model()
+        cm = session.calibration_model()
+        missing = []
+        if not pm.get_brillouin_regions() \
+                or not pm.get_rayleigh_regions():
+            missing.append(
+                "no Brillouin/Rayleigh peak regions selected")
+        if cm.frequencies_by_time_interpolator is None:
+            missing.append("no valid calibration")
+        if missing:
+            self.batch_evaluation_messages.append(
+                f"{file['path']} repetition {rep_key}: "
+                f"skipped evaluation - {'; '.join(missing)}.")
+            return False
+
+        # Still evaluated, but flagged: the missing calibrations
+        # are interpolated over from the remaining ones.
+        gaps = calibration_gaps_text(*calibration_gaps(
+            session.get_calib_keys() or [],
+            session.extraction_model(), cm))
+        if gaps:
+            self.batch_evaluation_messages.append(
+                f"{file['path']} repetition {rep_key}: "
+                f"evaluated with incomplete calibrations "
+                f"({gaps}).")
+
+        evc = EvaluationController()
+        evc.set_nr_brillouin_peaks(
+            cfg_evaluation['nr_brillouin_peaks'])
+        evc.set_bounds(cfg_evaluation['bounds_w0'])
+        evc.set_bounds_fwhm(cfg_evaluation['bounds_fwhm'])
+        self.widget_evaluation_view.evaluate(
+            blocking=True, notify_blocked=False)
+        # start_batch_evaluation() already refuses to start a
+        # batch while an export is running, but if one somehow
+        # got started anyway (or started on another instance),
+        # evaluate() above silently declined to run at all -
+        # applying/exporting this repetition's (stale, possibly
+        # entirely absent) results would be worse than just
+        # flagging it as skipped.
+        if getattr(self, 'export_running', False):
+            self.batch_evaluation_messages.append(
+                f"{file['path']} repetition {rep_key}: "
+                f"skipped evaluation - an export was running.")
+            return False
+        return False
+
+    def _batch_apply_quality(self, file, rep_key):
+        """
+        Applies the batch dialog's quality thresholds to the saved
+        evaluation results of the current repetition - nothing is
+        fitted again. The thresholds replace the file's own and
+        quality_pass is written from them, same as "Apply to
+        results" on the Quality tab.
+        """
+        evm = Session.get_instance().evaluation_model()
+        if evm is None or not np.any(~np.isnan(evm.results['time'])):
+            self.batch_evaluation_messages.append(
+                f"{file['path']} repetition {rep_key}: quality "
+                f"thresholds not applied - the repetition is not "
+                f"evaluated.")
+            return
+        evm.quality_thresholds = copy.deepcopy(self.batch_config['quality'])
+        EvaluationController().apply_quality_thresholds()
+
     # progress ('none', 'extraction', ...) a repetition needs to have
     # reached for a step to be done
     STEP_PROGRESS = {STEP_EXTRACTION: 1, STEP_CALIBRATION: 2,
@@ -1949,6 +1976,10 @@ class BMicro(QtWidgets.QMainWindow):
         repetitions = file.get('repetitions')
         if self.batch_reanalyse or not repetitions \
                 or self.batch_config['export']['export']:
+            return True
+        if self.batch_config['quality_apply']['apply'] and any(
+                repetitions[key]['progress'] == 'evaluation'
+                for key in self._selected_batch_repetitions(file)):
             return True
         if not self.batch_config['evaluation']['evaluate']:
             return False

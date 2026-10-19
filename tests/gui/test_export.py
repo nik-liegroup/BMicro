@@ -133,24 +133,19 @@ def test_export_surface_and_overview_brightfield(qtbot, mocker, tmp_path):
     window.export_file(blocking=True)
 
     # SurfaceScan.h5 is not inside a 'RawData' folder here, so bmlab's
-    # exporters write directly next to the source file (see e.g.
-    # FluorescenceExport.export / SurfaceExport._plot_path).
-    assert (
-        tmp_path / 'surface_BMrep0_z_surface.png').exists()
+    # exporters write next to the source file (see e.g.
+    # SurfaceExport._plot_path), one folder per kind and Brillouin
+    # repetition: Surface_BMrep0, Overview_BMrep0.
+    surface = tmp_path / 'Surface_BMrep0'
+    assert (surface / 'surface_BMrep0_z_surface.png').exists()
     # SurfaceScan.h5 predates the coarse pre-scan point datasets, so
     # no prescan_points plot should be produced for it.
-    assert not (
-        tmp_path
-        / 'surface_BMrep0_prescan_points.png').exists()
-    # 2 z-planes x 2 tiles each - one tiled-mosaic file per z-plane.
-    assert (
-        tmp_path
-        / 'overviewZStack_0_BMrep0_tiled.tif').exists()
-    assert (
-        tmp_path
-        / 'overviewZStack_1_BMrep0_tiled.tif').exists()
-    assert (
-        tmp_path / 'surface_BMrep0_metrics.json').exists()
+    assert not (surface / 'surface_BMrep0_prescan_points.png').exists()
+    assert (surface / 'surface_BMrep0_metrics.json').exists()
+    # 2 z-planes x 2 tiles each - one tiled-mosaic file per z-plane,
+    # numbered in the order they were taken.
+    overviews = sorted((tmp_path / 'Overview_BMrep0').glob('overview_*.tif'))
+    assert [o.name.split('_')[1] for o in overviews] == ['1', '2']
 
     Session.get_instance().clear()
     window.close()
