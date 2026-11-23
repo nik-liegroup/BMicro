@@ -1,24 +1,32 @@
 cff-version: 1.2.0
-message: "If you use this software, please cite it as below."
+message: "If you use this software, please cite it as below and also cite the upstream BMicro listed under references."
 type: software
-title: "BMicro"
+title: "BMicro (fork)"
 abstract: >-
-  Graphical application for the evaluation of Brillouin microscopy data; this version adds batch evaluation
-  with a progress cache, acquisition information, plot export and the Stokes/anti-Stokes shift.
+  Graphical program for the evaluation of Brillouin microscopy data (requires the matching fork of bmlab, 0.14.0). Modified fork of BMicro by the BMicro developers, released under the GNU General Public License v3.0. The
+  modifications by Niklas Gampl are documented in the CHANGELOG and the commit history.
 authors:
   - family-names: Gampl
     given-names: Niklas
-  - name: "BMicro developers"
 version: 0.14.0
 license: GPL-3.0-only
 repository-code: "https://github.com/nik-liegroup/BMicro"
 keywords:
   - Brillouin microscopy
   - data evaluation
+  - BMicro
+  - bmlab
 references:
   - type: software
     title: "BMicro"
     authors:
-      - name: "BMicro developers"
+      - family-names: Bär
+        given-names: Matthias
+      - family-names: Müller
+        given-names: Paul
+      - family-names: Schlüßler
+        given-names: Raimund
+      - family-names: Beck
+        given-names: Timon
     repository-code: "https://github.com/BrillouinMicroscopy/BMicro"
     license: GPL-3.0-only

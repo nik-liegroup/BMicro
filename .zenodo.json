@@ -1,0 +1,25 @@
+{
+  "upload_type": "software",
+  "access_right": "open",
+  "license": "gpl-3.0-only",
+  "title": "BMicro (fork)",
+  "description": "<p>Graphical program for the evaluation of Brillouin microscopy data. This is a modified fork of <a href=\"https://github.com/BrillouinMicroscopy/BMicro\">BMicro</a> by the BMicro developers, released under the GNU General Public License v3.0. The modifications by Niklas Gampl are documented in the CHANGELOG and the commit history. It requires the matching fork of bmlab (0.14.0).</p><p>The upstream code, its history and its authors are credited in the upstream repository; see the related identifier and the contributors listed here.</p>",
+  "creators": [
+    {"name": "Gampl, Niklas"}
+  ],
+  "contributors": [
+    {"name": "Bär, Matthias", "type": "Other"},
+    {"name": "Müller, Paul", "type": "Other"},
+    {"name": "Schlüßler, Raimund", "type": "Other"},
+    {"name": "Beck, Timon", "type": "Other"}
+  ],
+  "keywords": ["Brillouin microscopy", "data evaluation", "BMicro", "bmlab"],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/BrillouinMicroscopy/BMicro",
+      "relation": "isDerivedFrom",
+      "resource_type": "software"
+    }
+  ],
+  "notes": "Derived work. The contributors listed are the authors of the upstream BMicro on which this fork is based; they are not authors of the modifications made in this fork."
+}
